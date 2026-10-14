@@ -41,8 +41,7 @@ func (h *ReleaseSigningAdminHandler) Generate(c *gin.Context) {
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrSigningDisabled):
-			response.Err(c, http.StatusServiceUnavailable, "SIGNING_DISABLED",
-				"release signing is not configured (RELEASE_KEY_ENCRYPTION_KEY is missing)")
+			response.Err(c, http.StatusServiceUnavailable, "SIGNING_DISABLED", service.ErrSigningDisabled.Error())
 		case errors.Is(err, store.ErrSigningKeyAlreadyActive):
 			response.Err(c, http.StatusConflict, "KEY_ALREADY_ACTIVE",
 				"this product already has an active signing key — rotate instead")
@@ -86,8 +85,7 @@ func (h *ReleaseSigningAdminHandler) Rotate(c *gin.Context) {
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrSigningDisabled):
-			response.Err(c, http.StatusServiceUnavailable, "SIGNING_DISABLED",
-				"release signing is not configured")
+			response.Err(c, http.StatusServiceUnavailable, "SIGNING_DISABLED", service.ErrSigningDisabled.Error())
 		default:
 			response.Internal(c, err)
 		}

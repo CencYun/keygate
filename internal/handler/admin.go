@@ -2985,13 +2985,22 @@ func analyticsFilter(c *gin.Context) store.AnalyticsFilter {
 		f.From, _ = time.Parse("2006-01-02", v)
 	}
 	if v := c.Query("to"); v != "" {
-		t, err := time.Parse("2006-01-02", v)
-		if err == nil {
-			// End-of-day: include the entire "to" date
-			f.To = t.Add(24*time.Hour - time.Nanosecond)
+		if t, ok := endOfDay(v); ok {
+			f.To = t
 		}
 	}
 	return f
+}
+
+// endOfDay parses a "to" date (YYYY-MM-DD) as the last instant of that
+// day, so a `created_at <= to` filter includes the whole date rather
+// than stopping at its midnight.
+func endOfDay(v string) (time.Time, bool) {
+	t, err := time.Parse("2006-01-02", v)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t.Add(24*time.Hour - time.Nanosecond), true
 }
 
 func (h *AdminHandler) AnalyticsSummary(c *gin.Context) {
@@ -3042,7 +3051,9 @@ func (h *AdminHandler) AnalyticsActivationTrend(c *gin.Context) {
 		from, _ = time.Parse("2006-01-02", v)
 	}
 	if v := c.Query("to"); v != "" {
-		to, _ = time.Parse("2006-01-02", v)
+		// A midnight bound would drop every activation made on the "to"
+		// day, which is usually today.
+		to, _ = endOfDay(v)
 	}
 	trend, err := h.Store.GetActivationTrend(c, productID, from, to)
 	if err != nil {

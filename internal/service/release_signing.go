@@ -88,7 +88,9 @@ func NewReleaseSigningService(c ReleaseSigningServiceConfig) *ReleaseSigningServ
 // ─── Sentinel errors ───
 
 var (
-	ErrSigningDisabled        = errors.New("release signing is not configured (RELEASE_KEY_ENCRYPTION_KEY missing)")
+	// Signing is wired only when both the master key and release storage
+	// are configured (see main.go), so the message names both.
+	ErrSigningDisabled        = errors.New("release signing is not configured: it needs RELEASE_KEY_ENCRYPTION_KEY and release storage (STORAGE_BUCKET, STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY)")
 	ErrArtifactTooLargeToSign = errors.New("artifact exceeds the configured signing size limit")
 	ErrSigningKeyMissing      = errors.New("product has no active signing key — generate one before signing")
 	ErrArtifactNotInStorage   = errors.New("artifact bytes not found in storage; upload may not be finalized")
