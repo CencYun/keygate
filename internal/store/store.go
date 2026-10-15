@@ -316,25 +316,15 @@ func (s *Store) ListAdmins(ctx context.Context, p Page) ([]*model.User, int, err
 	return out, total, nil
 }
 
-// SetUserRole updates a user's role. Only owners can promote/demote.
-func (s *Store) SetUserRole(ctx context.Context, userID, role string) error {
-	if role != model.RoleOwner && role != model.RoleAdmin && role != model.RoleUser {
-		return fmt.Errorf("invalid role: %s", role)
-	}
-	_, err := s.DB.NewUpdate().Model((*model.User)(nil)).
-		Set("role = ?, updated_at = now()", role).
-		Where("id = ?", userID).Exec(ctx)
-	return err
-}
-
-// CreatePlaceholderUser creates a user with minimal info for team invites.
-// The user will get proper name when they first log in.
-func (s *Store) CreatePlaceholderUser(ctx context.Context, email, role string) error {
+// CreatePlaceholderUser creates a plain user with minimal info for team
+// invites; the invite then grants the role through SetRoleAtomic. The
+// user will get proper name when they first log in.
+func (s *Store) CreatePlaceholderUser(ctx context.Context, email string) error {
 	u := &model.User{
 		ID:    newID(),
 		Email: email,
 		Name:  "",
-		Role:  role,
+		Role:  model.RoleUser,
 	}
 	_, err := s.DB.NewInsert().Model(u).
 		On("CONFLICT (email) DO NOTHING"). // Don't overwrite existing user
@@ -348,84 +338,139 @@ func (s *Store) CountOwners(ctx context.Context) (int, error) {
 		Where("role = 'owner'").Count(ctx)
 }
 
-// ErrLastOwner is returned by DemoteOwnerAtomic when the demotion
-// would leave zero owners. Locked-by-design: callers must NOT bypass
-// this check with a raw SetUserRole call from the handler layer.
+// SetupNeeded reports whether this database still waits for its first
+// owner. Setup creates that owner without authentication, so anything
+// showing the install is in use closes it: setup_complete, or an owner, an
+// admin or a product in the database. Counting owners alone left setup
+// open on installs whose admins never became owner (#42). Pass the setup
+// transaction as db to check under its lock.
+func (s *Store) SetupNeeded(ctx context.Context, db bun.IDB) (bool, error) {
+	complete, err := getSettingIn(ctx, db, "setup_complete")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	if complete == "true" {
+		return false, nil
+	}
+	var installed bool
+	err = db.NewRaw(`SELECT EXISTS (SELECT 1 FROM users WHERE role IN ('owner', 'admin'))
+		OR EXISTS (SELECT 1 FROM products)`).Scan(ctx, &installed)
+	return !installed, err
+}
+
+// EnsureOwner promotes an admin to owner when admins exist but no owner
+// does, and returns the promoted email ("" when nothing changed). It picks
+// the admin listed first in ADMIN_EMAILS, else the earliest admin.
+// Installs from before setup existed, and admins who first signed in
+// through ADMIN_EMAILS after startup, were left with no owner, so no one
+// could manage roles.
+func (s *Store) EnsureOwner(ctx context.Context, adminEmails []string) (string, error) {
+	var email string
+	err := s.DB.NewRaw(`UPDATE users SET role = 'owner', updated_at = now()
+		WHERE id = (SELECT id FROM users WHERE role = 'admin'
+			ORDER BY array_position(?::text[], email) NULLS LAST, created_at, id LIMIT 1)
+		AND NOT EXISTS (SELECT 1 FROM users WHERE role = 'owner')
+		RETURNING email`, pgdialect.Array(adminEmails)).Scan(ctx, &email)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return email, err
+}
+
+// PromoteAdminEmail raises a plain user listed in ADMIN_EMAILS to admin,
+// or to owner when the install has no owner yet, and returns the role
+// the user ends up with.
+func (s *Store) PromoteAdminEmail(ctx context.Context, userID string) (string, error) {
+	var role string
+	err := s.DB.NewRaw(`UPDATE users SET updated_at = now(), role = CASE
+			WHEN EXISTS (SELECT 1 FROM users WHERE role = 'owner') THEN 'admin' ELSE 'owner' END
+		WHERE id = ? AND role = 'user'
+		RETURNING role`, userID).Scan(ctx, &role)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = s.DB.NewRaw("SELECT role FROM users WHERE id = ?", userID).Scan(ctx, &role)
+	}
+	return role, err
+}
+
+// ErrLastOwner is returned when a role change would leave zero owners.
+// Every change that can take the owner role away goes through
+// SetRoleAtomic; raw UPDATEs that only grant a role (setup,
+// ADMIN_EMAILS promotion, EnsureOwner) cannot break the invariant.
 var ErrLastOwner = errors.New("cannot remove the last owner")
 
-// DemoteOwnerAtomic locks every owner row in a tx, recounts, and
-// demotes the target only if at least one owner would remain.
-//
-// Why a tx with FOR UPDATE? The original handler did
-//  1. CountOwners()  (no lock)
-//  2. SetUserRole(target, "user")  (separate stmt)
-//
-// Two concurrent demotions of two DIFFERENT owners — when the org
-// has exactly 2 owners — could both pass step 1 (each sees count=2,
-// "OK to remove one"), then both step 2 → zero owners. We've seen
-// this in production-like load testing.
-//
-// FOR UPDATE on the owner rows serialises the two demotions: the
-// second one waits, re-counts after the first has committed (sees
-// count=1), and rejects with ErrLastOwner.
-//
-// targetID may or may not currently be an owner — if it's not, the
-// UPDATE is a no-op (0 rows affected) and we return nil, matching
-// the previous handler-side semantics (caller already verified the
-// target was admin/owner before reaching us).
-func (s *Store) DemoteOwnerAtomic(ctx context.Context, targetID string) error {
-	// Acquire a session-scoped advisory lock OUTSIDE the tx so the
-	// lock is held by the connection itself. Without this, when
-	// bun's pool hands two concurrent calls different connections,
-	// FOR UPDATE on per-row owner locks only serialises demotions
-	// of the SAME target — two demotions of A and B then both
-	// pass count==2 and zero owners remain.
-	//
-	// pg_advisory_lock(N) blocks until acquired. We release it in
-	// a defer; if the process crashes the session ends and Postgres
-	// reaps the lock automatically.
-	conn, err := s.DB.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if _, err := conn.NewRaw("SELECT pg_advisory_lock(8675310)").Exec(ctx); err != nil {
-		return err
-	}
-	defer func() {
-		_, _ = conn.NewRaw("SELECT pg_advisory_unlock(8675310)").Exec(context.Background())
-	}()
+// ErrNotOwner is returned by SetRoleAtomic when the acting user is no
+// longer an owner by the time the team lock is held.
+var ErrNotOwner = errors.New("only an owner can manage team members")
 
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback() //nolint:errcheck
+// ErrUserNotFound is returned by SetRoleAtomic when the target user does
+// not exist.
+var ErrUserNotFound = errors.New("user not found")
 
-	var ownerCount int
-	if err := tx.NewRaw("SELECT COUNT(*) FROM users WHERE role = 'owner'").Scan(ctx, &ownerCount); err != nil {
-		return err
-	}
+// TeamLockKey serializes every team role change.
+const TeamLockKey = 8675310
 
-	// Determine the target's current role. If they're an owner AND
-	// they're the last one, refuse. If they're admin (not owner) we
-	// can demote freely — the last-owner invariant is unaffected.
+// SetRoleAtomic changes a team member's role under one transaction lock
+// shared by every team change, and reports the role the target held
+// before, read under that lock, and whether the role changed. It
+// recounts owners inside the lock: a change that takes the owner role
+// from the last owner fails with ErrLastOwner. When actorID is set, the
+// actor must still be an owner under the lock, or it fails with
+// ErrNotOwner; the handler's own check ran before the lock, and a
+// concurrent change may have demoted the actor since. An empty actorID
+// skips that check, for changes the system makes on its own.
+//
+// Why the lock? Counting owners and then updating in separate
+// statements let two concurrent demotions of two different owners both
+// see count=2 and leave zero owners; inviting an owner as admin skipped
+// the check entirely. Row locks alone only serialize changes to the
+// same target, so one advisory lock covers them all. Comparing the
+// current role inside it also keeps concurrent identical changes from
+// each reporting a change.
+func (s *Store) SetRoleAtomic(ctx context.Context, actorID, targetID, role string) (string, bool, error) {
+	if role != model.RoleOwner && role != model.RoleAdmin && role != model.RoleUser {
+		return "", false, fmt.Errorf("invalid role: %s", role)
+	}
 	var targetRole string
-	if err := tx.NewRaw("SELECT role FROM users WHERE id = ?", targetID).Scan(ctx, &targetRole); err != nil {
-		return err
-	}
-	if targetRole == model.RoleOwner && ownerCount <= 1 {
-		return ErrLastOwner
-	}
+	changed := false
+	err := s.WithXactLock(ctx, TeamLockKey, func(ctx context.Context, tx bun.Tx) error {
+		if actorID != "" {
+			var actorRole string
+			err := tx.NewRaw("SELECT role FROM users WHERE id = ?", actorID).Scan(ctx, &actorRole)
+			if errors.Is(err, sql.ErrNoRows) || (err == nil && actorRole != model.RoleOwner) {
+				return ErrNotOwner
+			}
+			if err != nil {
+				return err
+			}
+		}
 
-	if _, err := tx.NewRaw(
-		"UPDATE users SET role = ?, updated_at = now() WHERE id = ?",
-		model.RoleUser, targetID,
-	).Exec(ctx); err != nil {
-		return err
-	}
+		err := tx.NewRaw("SELECT role FROM users WHERE id = ?", targetID).Scan(ctx, &targetRole)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrUserNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if targetRole == role {
+			return nil
+		}
+		if targetRole == model.RoleOwner {
+			var ownerCount int
+			if err := tx.NewRaw("SELECT COUNT(*) FROM users WHERE role = 'owner'").Scan(ctx, &ownerCount); err != nil {
+				return err
+			}
+			if ownerCount <= 1 {
+				return ErrLastOwner
+			}
+		}
 
-	return tx.Commit()
+		if _, err := tx.NewRaw("UPDATE users SET role = ?, updated_at = now() WHERE id = ?", role, targetID).Exec(ctx); err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	})
+	return targetRole, changed, err
 }
 
 // ─── API Key ───

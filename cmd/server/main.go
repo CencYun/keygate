@@ -473,6 +473,11 @@ func main() {
 			logger.Error("sync admin emails failed", "error", err)
 		}
 	}
+	if email, err := db.EnsureOwner(context.Background(), cfg.AdminEmails); err != nil {
+		logger.Error("ensure owner failed", "error", err)
+	} else if email != "" {
+		logger.Info("no owner found, promoted an admin to owner", "email", email)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -678,7 +683,7 @@ func main() {
 
 	v1.GET("/version", systemH.GetVersion)
 
-	setupH := handler.NewSetupHandler(db)
+	setupH := handler.NewSetupHandler(db, cfg.AdminEmails)
 	v1.GET("/setup/status", setupH.Status)
 	v1.POST("/setup/initialize", setupH.Initialize)
 

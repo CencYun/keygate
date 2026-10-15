@@ -7,6 +7,11 @@ const BASE = `${import.meta.env.VITE_API_URL || ""}/api/v1`
 // auth layer retries instead (see AuthProvider).
 export class ServiceUnavailableError extends Error {}
 
+// errorCode reads the server's error code from a failed request, if any.
+export function errorCode(err: unknown): string | undefined {
+  return (err as { code?: string } | null)?.code
+}
+
 type RefreshOutcome = "ok" | "denied" | "unavailable"
 
 // The session cookie lives 24 hours; the refresh cookie 30 days. When a
@@ -94,7 +99,9 @@ async function request<T>(path: string, opts?: RequestInit, retried = false): Pr
       `Request failed (${res.status}${res.statusText ? ` ${res.statusText}` : ""})`
     // A 429 or 5xx says nothing about the session: the server is busy or
     // failing. Callers that decide "signed in or not" must tell it apart.
-    throw res.status === 429 || res.status >= 500 ? new ServiceUnavailableError(msg) : new Error(msg)
+    // The server's error code rides along for callers that translate it.
+    const err = res.status === 429 || res.status >= 500 ? new ServiceUnavailableError(msg) : new Error(msg)
+    throw Object.assign(err, { code: typeof json?.error?.code === "string" ? json.error.code : undefined })
   }
   return (json?.data !== undefined ? json.data : json) as T
 }
@@ -122,7 +129,8 @@ export const site = {
 }
 
 // ─── Auth ───
-// First run setup. Public: the server refuses initialize once an owner exists.
+// First run setup. Public: the server refuses initialize once an owner, an
+// admin or a product exists.
 export const setup = {
   status: () => get<{ needed: boolean; step: string }>("/setup/status"),
   initialize: (body: {

@@ -172,8 +172,9 @@ func (h *AuthHandler) OTPVerify(c *gin.Context) {
 
 	// Auto-promote if email is in ADMIN_EMAILS
 	if h.Config.IsAdminEmail(user.Email) && user.Role == model.RoleUser {
-		_ = h.Store.SetUserRole(c, user.ID, model.RoleAdmin)
-		user.Role = model.RoleAdmin
+		if role, err := h.Store.PromoteAdminEmail(c, user.ID); err == nil {
+			user.Role = role
+		}
 	}
 
 	// Welcome email for new users

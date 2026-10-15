@@ -245,8 +245,9 @@ func (h *AuthHandler) DevLogin(c *gin.Context) {
 	})
 	// Auto-promote if email is in ADMIN_EMAILS and user is currently just 'user'
 	if h.Config.IsAdminEmail(user.Email) && user.Role == model.RoleUser {
-		_ = h.Store.SetUserRole(c, user.ID, model.RoleAdmin)
-		user.Role = model.RoleAdmin
+		if role, err := h.Store.PromoteAdminEmail(c, user.ID); err == nil {
+			user.Role = role
+		}
 	}
 
 	response.OK(c, gin.H{

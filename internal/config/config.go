@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -212,13 +213,13 @@ func (c *Config) IsDevLoginAllowed() bool { return c.normalizedEnv() == "develop
 // IsAdminEmail checks if an email is in the ADMIN_EMAILS list.
 // Used for backward compatibility and initial setup bootstrap.
 // In normal operation, admin status is determined by the user's role in the database.
+//
+// The list is lower-cased at load, so the address is lower-cased and
+// compared exactly. strings.EqualFold would also match Unicode case
+// folds such as "ſ" (U+017F) for "s", letting a look-alike address pass
+// for a listed one.
 func (c *Config) IsAdminEmail(email string) bool {
-	for _, e := range c.AdminEmails {
-		if strings.EqualFold(e, email) {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.AdminEmails, strings.ToLower(strings.TrimSpace(email)))
 }
 
 // deriveLivemode decides whether the server should treat Stripe

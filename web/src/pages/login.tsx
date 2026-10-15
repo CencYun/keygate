@@ -33,7 +33,7 @@ export default function LoginPage() {
   const [otpError, setOtpError] = useState("")
   const [otpCooldown, setOtpCooldown] = useState(0)
 
-  // A fresh install has no owner yet: send the first visitor to setup.
+  // A fresh install has no admins or products yet: send the first visitor to setup.
   useEffect(() => {
     setup
       .status()

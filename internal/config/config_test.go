@@ -58,6 +58,8 @@ func TestIsAdminEmail(t *testing.T) {
 		{"boss@company.com", true},
 		{"user@other.com", false},
 		{"", false},
+		// A Unicode case fold of "s", not an ASCII "s".
+		{"boſſ@company.com", false},
 	}
 	for _, tt := range tests {
 		if got := c.IsAdminEmail(tt.email); got != tt.want {

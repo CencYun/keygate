@@ -11,18 +11,18 @@ import (
 	"github.com/tabloy/keygate/internal/store"
 )
 
-// TestDemoteOwnerAtomic_RaceTwoOwners exercises the exact bug the
+// TestDemoteOwner_RaceTwoOwners exercises the exact bug the
 // atomic implementation fixes: with 2 owners, two concurrent
 // demotion attempts MUST NOT both succeed (which would leave zero
 // owners). One wins; the other gets ErrLastOwner.
 //
-// Without FOR UPDATE the old "count, then update" pattern would let
-// both reads see count=2, both writes succeed, and the org be left
-// owner-less — locking everyone out of team-admin permanently.
+// Without the team lock (one advisory transaction lock around every
+// role change) the old "count, then update" pattern would let both
+// reads see count=2, both writes succeed, and leave no owner, locking
+// everyone out of team management for good.
 //
-// We run many iterations to make the race window observable on
-// PostgreSQL's typical row-locking timing.
-func TestDemoteOwnerAtomic_RaceTwoOwners(t *testing.T) {
+// We run many iterations to make the race window observable.
+func TestDemoteOwner_RaceTwoOwners(t *testing.T) {
 	s := setupTestDB(t)
 	defer s.Close()
 	ctx := context.Background()
@@ -51,12 +51,12 @@ func TestDemoteOwnerAtomic_RaceTwoOwners(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-ready
-			results[0] = s.DemoteOwnerAtomic(ctx, idA)
+			results[0] = demoteOwner(ctx, s, idA)
 		}()
 		go func() {
 			defer wg.Done()
 			<-ready
-			results[1] = s.DemoteOwnerAtomic(ctx, idB)
+			results[1] = demoteOwner(ctx, s, idB)
 		}()
 		close(ready) // release both at once
 		wg.Wait()
@@ -102,9 +102,9 @@ func TestDemoteOwnerAtomic_RaceTwoOwners(t *testing.T) {
 	}
 }
 
-// TestDemoteOwnerAtomic_HappyPath — single demotion of an owner
+// TestDemoteOwner_HappyPath: single demotion of an owner
 // when 2+ owners exist must succeed without error.
-func TestDemoteOwnerAtomic_HappyPath(t *testing.T) {
+func TestDemoteOwner_HappyPath(t *testing.T) {
 	s := setupTestDB(t)
 	defer s.Close()
 	ctx := context.Background()
@@ -117,7 +117,7 @@ func TestDemoteOwnerAtomic_HappyPath(t *testing.T) {
 		_, _ = s.DB.NewRaw("DELETE FROM users WHERE email IN (?, ?)", emailA, emailB).Exec(ctx)
 	}()
 
-	if err := s.DemoteOwnerAtomic(ctx, idA); err != nil {
+	if err := demoteOwner(ctx, s, idA); err != nil {
 		t.Fatalf("demotion failed: %v", err)
 	}
 
@@ -130,10 +130,10 @@ func TestDemoteOwnerAtomic_HappyPath(t *testing.T) {
 	}
 }
 
-// TestDemoteOwnerAtomic_LastOwner — when there's only 1 owner in
+// TestDemoteOwner_LastOwner: when there's only 1 owner in
 // the whole table, the demotion must reject regardless of how many
 // concurrent attempts happen.
-func TestDemoteOwnerAtomic_LastOwner(t *testing.T) {
+func TestDemoteOwner_LastOwner(t *testing.T) {
 	s := setupTestDB(t)
 	defer s.Close()
 	ctx := context.Background()
@@ -162,9 +162,9 @@ func TestDemoteOwnerAtomic_LastOwner(t *testing.T) {
 		}
 	}()
 
-	// Now Solo is the only owner. Any DemoteOwnerAtomic on Solo
+	// Now Solo is the only owner. Any demotion of Solo
 	// must error with ErrLastOwner.
-	err := s.DemoteOwnerAtomic(ctx, idSolo)
+	err := demoteOwner(ctx, s, idSolo)
 	if !errors.Is(err, store.ErrLastOwner) {
 		t.Fatalf("expected ErrLastOwner, got %v", err)
 	}
@@ -188,7 +188,7 @@ func TestDemoteOwnerAtomic_LastOwner(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-ready
-			if err := s.DemoteOwnerAtomic(ctx, idSolo); err == nil {
+			if err := demoteOwner(ctx, s, idSolo); err == nil {
 				atomic.AddInt32(&nilCount, 1)
 			}
 		}()
@@ -285,4 +285,90 @@ func itoa(n int) string {
 		digits[i], digits[j] = digits[j], digits[i]
 	}
 	return string(digits)
+}
+
+// Two owners inviting each other as admin at the same moment: inviting
+// an owner as admin demotes them, and used to skip the team lock, so
+// both could succeed and leave no owner. Now one wins; the other is
+// refused because its actor was just demoted.
+func TestSetRoleAtomic_MutualInviteAsAdmin(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	for i := range 30 {
+		emailA := uniqEmail(t, i, "mutualA")
+		emailB := uniqEmail(t, i, "mutualB")
+		idA := mustCreateOwner(t, s, ctx, emailA)
+		idB := mustCreateOwner(t, s, ctx, emailB)
+		t.Cleanup(func() { _, _ = s.DB.NewRaw("DELETE FROM users WHERE email IN (?, ?)", emailA, emailB).Exec(ctx) })
+
+		var wg sync.WaitGroup
+		results := make([]error, 2)
+		ready := make(chan struct{})
+		wg.Add(2)
+		go func() { defer wg.Done(); <-ready; _, _, results[0] = s.SetRoleAtomic(ctx, idA, idB, "admin") }()
+		go func() { defer wg.Done(); <-ready; _, _, results[1] = s.SetRoleAtomic(ctx, idB, idA, "admin") }()
+		close(ready)
+		wg.Wait()
+
+		var remaining int
+		if err := s.DB.NewRaw("SELECT COUNT(*) FROM users WHERE role='owner' AND email IN (?, ?)", emailA, emailB).Scan(ctx, &remaining); err != nil {
+			t.Fatal(err)
+		}
+		if remaining != 1 {
+			t.Fatalf("iter %d: %d of {A,B} remain owner, want 1 (errs: %v, %v)", i, remaining, results[0], results[1])
+		}
+		refused := 0
+		for _, err := range results {
+			if errors.Is(err, store.ErrNotOwner) {
+				refused++
+			} else if err != nil {
+				t.Fatalf("iter %d: unexpected error: %v", i, err)
+			}
+		}
+		if refused != 1 {
+			t.Fatalf("iter %d: want exactly one ErrNotOwner, got %v, %v", i, results[0], results[1])
+		}
+	}
+}
+
+// An owner demoted after the handler checked them, but before their own
+// change runs, is refused under the lock.
+func TestSetRoleAtomic_ActorMustStillBeOwner(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	idA := mustCreateOwner(t, s, ctx, uniqEmail(t, 0, "actorA"))
+	idB := mustCreateOwner(t, s, ctx, uniqEmail(t, 0, "actorB"))
+	idC := mustCreateOwner(t, s, ctx, uniqEmail(t, 0, "actorC"))
+	defer func() { _, _ = s.DB.NewRaw("DELETE FROM users WHERE id IN (?, ?, ?)", idA, idB, idC).Exec(ctx) }()
+
+	if _, _, err := s.SetRoleAtomic(ctx, idA, idB, "admin"); err != nil {
+		t.Fatalf("owner A demoting B: %v", err)
+	}
+	if _, _, err := s.SetRoleAtomic(ctx, idB, idC, "admin"); !errors.Is(err, store.ErrNotOwner) {
+		t.Fatalf("demoted B changing C: got %v, want ErrNotOwner", err)
+	}
+	var role string
+	if err := s.DB.NewRaw("SELECT role FROM users WHERE id = ?", idC).Scan(ctx, &role); err != nil || role != "owner" {
+		t.Fatalf("C is %q (err %v), want owner unchanged", role, err)
+	}
+	if _, _, err := s.SetRoleAtomic(ctx, idA, idB, "superuser"); err == nil {
+		t.Fatal("an unknown role was accepted")
+	}
+	if prev, changed, err := s.SetRoleAtomic(ctx, idA, idB, "admin"); err != nil || changed || prev != "admin" {
+		t.Errorf("repeating B's role: previous %q, changed %v, err %v, want admin and no change", prev, changed, err)
+	}
+	if _, _, err := s.SetRoleAtomic(ctx, idA, "no-such-user", "admin"); !errors.Is(err, store.ErrUserNotFound) {
+		t.Errorf("missing target: got %v, want ErrUserNotFound", err)
+	}
+}
+
+// demoteOwner removes a member from the team as the system would, with
+// no acting user.
+func demoteOwner(ctx context.Context, s *store.Store, id string) error {
+	_, _, err := s.SetRoleAtomic(ctx, "", id, "user")
+	return err
 }

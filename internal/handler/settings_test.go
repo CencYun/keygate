@@ -35,6 +35,8 @@ func TestGetSettingsOutputIsWritableBack(t *testing.T) {
 		"site_name":                  "Acme",
 		"stripe_webhook_secret":      "whsec_live",
 		"stripe_webhook_endpoint_id": "we_1",
+		// Written by setup; must be neither returned nor writable.
+		"setup_complete": "true",
 	}
 
 	for key, val := range stored {
@@ -46,7 +48,7 @@ func TestGetSettingsOutputIsWritableBack(t *testing.T) {
 		}
 	}
 
-	for _, key := range []string{"stripe_webhook_secret", "stripe_webhook_endpoint_id"} {
+	for _, key := range []string{"stripe_webhook_secret", "stripe_webhook_endpoint_id", "setup_complete"} {
 		if !settingsSecret[key] && !settingsServerOwned[key] {
 			t.Errorf("%q must never be returned by GetSettings", key)
 		}

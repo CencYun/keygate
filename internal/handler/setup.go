@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -14,35 +15,28 @@ import (
 // SetupHandler manages the first-run setup wizard.
 type SetupHandler struct {
 	Store *store.Store
+	// AdminEmails is ADMIN_EMAILS. When set, only those addresses can
+	// become owner through setup, so a stranger who reaches a fresh
+	// install first cannot claim it.
+	AdminEmails []string
 }
 
-func NewSetupHandler(s *store.Store) *SetupHandler {
-	return &SetupHandler{Store: s}
-}
-
-// setupNeeded returns true if no owner exists and setup_complete is not "true".
-func (h *SetupHandler) setupNeeded(c *gin.Context) (bool, string) {
-	complete, _ := h.Store.GetSetting(c, "setup_complete")
-	if complete == "true" {
-		return false, "complete"
-	}
-
-	ownerCount, err := h.Store.CountOwners(c)
-	if err != nil {
-		// If we can't count owners, assume setup is needed
-		return true, "initialize"
-	}
-	if ownerCount > 0 {
-		return false, "complete"
-	}
-
-	return true, "initialize"
+func NewSetupHandler(s *store.Store, adminEmails []string) *SetupHandler {
+	return &SetupHandler{Store: s, AdminEmails: adminEmails}
 }
 
 // Status returns whether setup is needed and which step the wizard is on.
 // GET /api/v1/setup/status
 func (h *SetupHandler) Status(c *gin.Context) {
-	needed, step := h.setupNeeded(c)
+	needed, err := h.Store.SetupNeeded(c.Request.Context(), h.Store.DB)
+	if err != nil {
+		response.Internal(c, err)
+		return
+	}
+	step := "complete"
+	if needed {
+		step = "initialize"
+	}
 	response.OK(c, gin.H{
 		"needed": needed,
 		"step":   step,
@@ -54,26 +48,11 @@ func (h *SetupHandler) Status(c *gin.Context) {
 // POST /api/v1/setup/initialize
 func (h *SetupHandler) Initialize(c *gin.Context) {
 	// 1. Verify setup not already complete
-	needed, _ := h.setupNeeded(c)
-	if !needed {
-		response.Err(c, http.StatusConflict, "SETUP_COMPLETE", "setup already complete")
-		return
-	}
-
-	// Acquire advisory lock — check the boolean result, not just SQL error
-	var locked bool
-	if err := h.Store.DB.NewRaw("SELECT pg_try_advisory_lock(8675309)").Scan(c, &locked); err != nil {
+	needed, err := h.Store.SetupNeeded(c.Request.Context(), h.Store.DB)
+	if err != nil {
 		response.Internal(c, err)
 		return
 	}
-	if !locked {
-		response.Err(c, http.StatusConflict, "SETUP_IN_PROGRESS", "another setup is in progress")
-		return
-	}
-	defer h.Store.DB.NewRaw("SELECT pg_advisory_unlock(8675309)").Exec(c)
-
-	// Re-check after acquiring lock
-	needed, _ = h.setupNeeded(c)
 	if !needed {
 		response.Err(c, http.StatusConflict, "SETUP_COMPLETE", "setup already complete")
 		return
@@ -111,6 +90,15 @@ func (h *SetupHandler) Initialize(c *gin.Context) {
 		response.BadRequest(c, err.Message)
 		return
 	}
+	// After every field check, so sending an invalid field cannot tell a
+	// listed address from an unlisted one. Both sides are lower-cased, so
+	// compare exactly: strings.EqualFold would let a Unicode fold such as
+	// "ſ" for "s" pass for a listed address, and create an owner no one
+	// can sign in as.
+	if len(h.AdminEmails) > 0 && !slices.Contains(h.AdminEmails, req.AdminEmail) {
+		response.Err(c, http.StatusForbidden, "SETUP_EMAIL_NOT_ALLOWED", "this server only accepts an owner email listed in ADMIN_EMAILS")
+		return
+	}
 
 	// All mutations in a single transaction — if any step fails, everything rolls back
 	ctx := c.Request.Context()
@@ -120,6 +108,26 @@ func (h *SetupHandler) Initialize(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
+
+	// Serialize setups and check again under the lock. A transaction lock
+	// holds one connection for the whole setup; a session lock taken on
+	// the pool could land on another connection and let two setups through.
+	var locked bool
+	if err := tx.NewRaw("SELECT pg_try_advisory_xact_lock(8675309)").Scan(ctx, &locked); err != nil {
+		response.Internal(c, err)
+		return
+	}
+	if !locked {
+		response.Err(c, http.StatusConflict, "SETUP_IN_PROGRESS", "another setup is in progress")
+		return
+	}
+	if needed, err := h.Store.SetupNeeded(ctx, tx); err != nil {
+		response.Internal(c, err)
+		return
+	} else if !needed {
+		response.Err(c, http.StatusConflict, "SETUP_COMPLETE", "setup already complete")
+		return
+	}
 
 	// Create owner user
 	userID := store.NewID()

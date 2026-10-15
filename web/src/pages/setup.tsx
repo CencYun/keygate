@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useSiteConfig } from "@/hooks/use-site-config"
 import { useI18n } from "@/i18n"
-import { setup } from "@/lib/api"
+import { errorCode, setup } from "@/lib/api"
 
 type ProductType = "desktop" | "saas" | "hybrid"
 
@@ -20,8 +20,8 @@ function slugify(s: string) {
 
 // First run: creates the owner account, the site name and the first
 // product with a starter plan, through POST /setup/initialize. The
-// server refuses the call once an owner exists, so the page is only
-// reachable while setup is still needed.
+// server refuses the call once an owner, an admin or a product exists,
+// so the page is only reachable while setup is still needed.
 export default function SetupPage() {
   const { t } = useI18n()
   const { logo_url, attribution_text, attribution_url } = useSiteConfig()
@@ -57,7 +57,8 @@ export default function SetupPage() {
       // configuration (name, branding) is fetched again with the new values.
       window.location.replace(`/login?email=${encodeURIComponent(adminEmail.trim().toLowerCase())}&setup=done`)
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("setup.failed"))
+      if (errorCode(err) === "SETUP_EMAIL_NOT_ALLOWED") setError(t("setup.emailNotAllowed"))
+      else setError(err instanceof Error ? err.message : t("setup.failed"))
     } finally {
       setSaving(false)
     }
@@ -76,95 +77,104 @@ export default function SetupPage() {
           <CardDescription>{t("setup.subtitle")}</CardDescription>
         </CardHeader>
         <CardContent>
-          <form onSubmit={submit} className="space-y-5">
-            <fieldset className="space-y-3">
-              <legend className="text-sm font-medium">{t("setup.you")}</legend>
-              <div className="space-y-1.5">
-                <Label htmlFor="admin-name">{t("common.name")}</Label>
-                <Input id="admin-name" value={adminName} onChange={(e) => setAdminName(e.target.value)} required />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="admin-email">{t("common.email")}</Label>
-                <Input
-                  id="admin-email"
-                  type="email"
-                  value={adminEmail}
-                  onChange={(e) => setAdminEmail(e.target.value)}
-                  required
-                />
-                <p className="text-xs text-muted-foreground">{t("setup.emailHint")}</p>
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="site-name">{t("setup.siteName")}</Label>
-                <Input
-                  id="site-name"
-                  value={siteName}
-                  onChange={(e) => setSiteName(e.target.value)}
-                  placeholder={t("setup.siteNamePlaceholder")}
-                  required
-                />
-              </div>
-            </fieldset>
+          {status.isError ? (
+            <div className="space-y-3 text-center">
+              <p className="text-sm text-destructive">{t("setup.statusFailed")}</p>
+              <Button variant="outline" disabled={status.isFetching} onClick={() => status.refetch()}>
+                {t("common.retry")}
+              </Button>
+            </div>
+          ) : (
+            <form onSubmit={submit} className="space-y-5">
+              <fieldset className="space-y-3">
+                <legend className="text-sm font-medium">{t("setup.you")}</legend>
+                <div className="space-y-1.5">
+                  <Label htmlFor="admin-name">{t("common.name")}</Label>
+                  <Input id="admin-name" value={adminName} onChange={(e) => setAdminName(e.target.value)} required />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="admin-email">{t("common.email")}</Label>
+                  <Input
+                    id="admin-email"
+                    type="email"
+                    value={adminEmail}
+                    onChange={(e) => setAdminEmail(e.target.value)}
+                    required
+                  />
+                  <p className="text-xs text-muted-foreground">{t("setup.emailHint")}</p>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="site-name">{t("setup.siteName")}</Label>
+                  <Input
+                    id="site-name"
+                    value={siteName}
+                    onChange={(e) => setSiteName(e.target.value)}
+                    placeholder={t("setup.siteNamePlaceholder")}
+                    required
+                  />
+                </div>
+              </fieldset>
 
-            <fieldset className="space-y-3">
-              <legend className="text-sm font-medium">{t("setup.firstProduct")}</legend>
-              <div className="space-y-1.5">
-                <Label htmlFor="product-name">{t("common.name")}</Label>
-                <Input
-                  id="product-name"
-                  value={productName}
-                  onChange={(e) => {
-                    setProductName(e.target.value)
-                    if (!slugTouched) setProductSlug(slugify(e.target.value))
-                  }}
-                  required
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="product-slug">{t("setup.productSlug")}</Label>
-                <Input
-                  id="product-slug"
-                  value={productSlug}
-                  onChange={(e) => {
-                    setSlugTouched(true)
-                    setProductSlug(e.target.value)
-                  }}
-                  required
-                />
-                <p className="text-xs text-muted-foreground">{t("setup.slugHint")}</p>
-              </div>
-              <div className="space-y-2" role="radiogroup" aria-label={t("setup.productType")}>
-                <Label>{t("setup.productType")}</Label>
-                {types.map((type) => (
-                  <label
-                    key={type}
-                    className={`flex cursor-pointer gap-3 rounded-md border p-3 text-sm ${
-                      productType === type ? "border-primary bg-primary/5" : ""
-                    }`}
-                  >
-                    <input
-                      type="radio"
-                      name="product-type"
-                      value={type}
-                      checked={productType === type}
-                      onChange={() => setProductType(type)}
-                      className="mt-0.5"
-                    />
-                    <span>
-                      <span className="font-medium">{t(`products.${type}`)}</span>
-                      <span className="block text-xs text-muted-foreground">{t(`products.${type}Desc`)}</span>
-                    </span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
+              <fieldset className="space-y-3">
+                <legend className="text-sm font-medium">{t("setup.firstProduct")}</legend>
+                <div className="space-y-1.5">
+                  <Label htmlFor="product-name">{t("common.name")}</Label>
+                  <Input
+                    id="product-name"
+                    value={productName}
+                    onChange={(e) => {
+                      setProductName(e.target.value)
+                      if (!slugTouched) setProductSlug(slugify(e.target.value))
+                    }}
+                    required
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="product-slug">{t("setup.productSlug")}</Label>
+                  <Input
+                    id="product-slug"
+                    value={productSlug}
+                    onChange={(e) => {
+                      setSlugTouched(true)
+                      setProductSlug(e.target.value)
+                    }}
+                    required
+                  />
+                  <p className="text-xs text-muted-foreground">{t("setup.slugHint")}</p>
+                </div>
+                <div className="space-y-2" role="radiogroup" aria-label={t("setup.productType")}>
+                  <Label>{t("setup.productType")}</Label>
+                  {types.map((type) => (
+                    <label
+                      key={type}
+                      className={`flex cursor-pointer gap-3 rounded-md border p-3 text-sm ${
+                        productType === type ? "border-primary bg-primary/5" : ""
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="product-type"
+                        value={type}
+                        checked={productType === type}
+                        onChange={() => setProductType(type)}
+                        className="mt-0.5"
+                      />
+                      <span>
+                        <span className="font-medium">{t(`products.${type}`)}</span>
+                        <span className="block text-xs text-muted-foreground">{t(`products.${type}Desc`)}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
 
-            {error && <p className="text-sm text-destructive">{error}</p>}
-            <Button type="submit" className="w-full" disabled={saving}>
-              {saving ? t("setup.creating") : t("setup.create")}
-            </Button>
-            <p className="text-xs text-muted-foreground text-center">{t("setup.after")}</p>
-          </form>
+              {error && <p className="text-sm text-destructive">{error}</p>}
+              <Button type="submit" className="w-full" disabled={saving}>
+                {saving ? t("setup.creating") : t("setup.create")}
+              </Button>
+              <p className="text-xs text-muted-foreground text-center">{t("setup.after")}</p>
+            </form>
+          )}
         </CardContent>
       </Card>
       {/* Attribution required by AGPL v3 Section 7(b) — see NOTICE */}

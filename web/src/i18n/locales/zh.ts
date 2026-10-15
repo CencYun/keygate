@@ -489,6 +489,8 @@ const zh = {
   "setup.creating": "创建中...",
   "setup.after": "会同时为该产品创建一个名为 Pro 的初始套餐，之后可以修改。",
   "setup.failed": "设置失败",
+  "setup.emailNotAllowed": "这台服务器只接受 ADMIN_EMAILS 里列出的邮箱作为所有者。",
+  "setup.statusFailed": "无法确认这台服务器是否还需要初始化。",
   "login.setupDone": "设置完成。请用刚才填写的邮箱登录。",
   "login.subtitle": "登录您的账户",
   "login.signInWith": "使用 {provider} 登录",

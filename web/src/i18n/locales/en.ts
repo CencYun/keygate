@@ -503,6 +503,8 @@ const en = {
   "setup.creating": "Creating...",
   "setup.after": "A starter plan called Pro is created for the product. You can change it later.",
   "setup.failed": "Setup failed",
+  "setup.emailNotAllowed": "This server only accepts an owner email listed in ADMIN_EMAILS.",
+  "setup.statusFailed": "Couldn't check whether this server still needs setup.",
   "login.setupDone": "Setup is complete. Sign in with the email you just entered.",
   "login.subtitle": "Sign in to your account",
   "login.signInWith": "Sign in with {provider}",

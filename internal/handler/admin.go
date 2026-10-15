@@ -3648,7 +3648,6 @@ var settingsWritable = map[string]bool{
 	"webhook_max_attempts": true, "webhook_timeout": true,
 	"quota_warning_threshold":          true,
 	service.ReminderDaysSetting:        true,
-	"setup_complete":                   true,
 	"maintenance_features_enabled":     true,
 	"feed_url_ttl_bound":               true,
 	"email_template_license_created":   true,
@@ -3711,7 +3710,8 @@ var settingsEnum = map[string][]string{
 
 // settingsServerOwned lists keys the server writes for itself — the
 // Stripe webhook auto-setup stores the endpoint id and signing secret
-// here. They are neither readable nor writable over the API.
+// here, and setup records setup_complete. They are neither readable nor
+// writable over the API.
 //
 // Leaving them in the GET response also broke saving outright: the
 // dashboard seeds its form from that response and PUTs the whole map
@@ -3723,6 +3723,7 @@ var settingsServerOwned = map[string]bool{
 	"stripe_webhook_secret_previous":       true,
 	"stripe_webhook_secret_previous_until": true,
 	"stripe_webhook_retire_endpoint_id":    true,
+	"setup_complete":                       true,
 }
 
 func (h *AdminHandler) GetSettings(c *gin.Context) {
@@ -4068,8 +4069,10 @@ func (h *AdminHandler) ListTeamMembers(c *gin.Context) {
 	listOK(c, "members", admins, total, page)
 }
 
-// InviteTeamMember promotes an existing user to admin, or creates a placeholder admin user.
-// Only owners can invite new admins.
+// InviteTeamMember sets a user's team role to admin or owner, creating a
+// plain placeholder user first for an address not seen yet. Every grant,
+// and demoting an owner to admin, runs through SetRoleAtomic. Only owners
+// can invite.
 func (h *AdminHandler) InviteTeamMember(c *gin.Context) {
 	// Only owner can manage team
 	actorEmail, ok := c.Get("email")
@@ -4116,37 +4119,46 @@ func (h *AdminHandler) InviteTeamMember(c *gin.Context) {
 		return
 	}
 
-	// Find or create user. Track whether THIS request changed
-	// anything — if not, skip the notification email to avoid
-	// spamming the invitee on repeated owner clicks.
-	roleChanged := false
+	// Find or create user. Only a request that changed the role writes
+	// the audit entry and sends the email, so repeated or concurrent
+	// clicks do not spam the invitee.
 	user, err := h.Store.FindUserByEmail(c, req.Email)
 	if err != nil {
-		// User doesn't exist yet — create placeholder (will get proper name on first login)
-		if err := h.Store.CreatePlaceholderUser(c, req.Email, role); err != nil {
+		// Not seen yet: a plain placeholder row (the name arrives on first
+		// login), raised below like any other user, so the grant also runs
+		// under the team lock and its actor check.
+		if err := h.Store.CreatePlaceholderUser(c, req.Email); err != nil {
 			response.Internal(c, err)
 			return
 		}
-		user, _ = h.Store.FindUserByEmail(c, req.Email)
-		roleChanged = true
-	} else {
-		// User exists — check if already same role (idempotent)
-		if user.Role == role {
-			response.OK(c, user)
-			return
-		}
-		if err := h.Store.SetUserRole(c, user.ID, role); err != nil {
+		if user, err = h.Store.FindUserByEmail(c, req.Email); err != nil {
 			response.Internal(c, err)
 			return
 		}
-		user.Role = role
-		roleChanged = true
+	}
+	// Under the team lock: inviting an owner as admin demotes them, and
+	// must not leave the install without an owner. The lock also decides
+	// whether anything changed, so concurrent identical invites count once.
+	previousRole, changed, err := h.Store.SetRoleAtomic(c, actorUser.ID, user.ID, role)
+	if err != nil {
+		// A placeholder created above stays as a plain user: harmless,
+		// and only left when the actor lost the owner role meanwhile.
+		teamRoleError(c, err)
+		return
+	}
+	if user, err = h.Store.FindUserByID(c, user.ID); err != nil {
+		response.Internal(c, err)
+		return
+	}
+	if !changed {
+		response.OK(c, user)
+		return
 	}
 
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "team", EntityID: user.ID, Action: "member_invited",
 		ActorType: "admin", ActorID: adminID(c),
-		Changes: map[string]any{"email": req.Email, "role": role},
+		Changes: map[string]any{"email": req.Email, "role": role, "previous_role": previousRole},
 	})
 
 	// Notify the new admin via email. Best-effort: a send failure
@@ -4154,7 +4166,7 @@ func (h *AdminHandler) InviteTeamMember(c *gin.Context) {
 	// out-of-band). The inviter (actor) name is shown so the
 	// recipient knows who added them, which helps spot social
 	// engineering ("why am I suddenly admin on Keygate?").
-	if roleChanged && h.Email != nil {
+	if h.Email != nil {
 		siteName, _ := h.Store.GetSetting(c, "site_name")
 		if siteName == "" {
 			siteName = "Keygate"
@@ -4172,6 +4184,20 @@ func (h *AdminHandler) InviteTeamMember(c *gin.Context) {
 	}
 
 	response.OK(c, user)
+}
+
+// teamRoleError answers a failed SetRoleAtomic.
+func teamRoleError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, store.ErrLastOwner):
+		response.BadRequest(c, "cannot remove the last owner")
+	case errors.Is(err, store.ErrNotOwner):
+		response.Forbidden(c, "only the owner can manage team members")
+	case errors.Is(err, store.ErrUserNotFound):
+		response.NotFound(c, "user not found")
+	default:
+		response.Internal(c, err)
+	}
 }
 
 // adminBaseURL infers the public base URL from the inbound request
@@ -4222,24 +4248,25 @@ func (h *AdminHandler) RemoveTeamMember(c *gin.Context) {
 		return
 	}
 
-	// Atomic demote: a SELECT … FOR UPDATE inside DemoteOwnerAtomic
-	// serialises concurrent demotion attempts so the last-owner
-	// invariant holds even under racing requests. The non-atomic
-	// "count then update" pattern that lived here previously could
-	// be tricked into zero owners by two simultaneous calls.
-	if err := h.Store.DemoteOwnerAtomic(c, targetID); err != nil {
-		if errors.Is(err, store.ErrLastOwner) {
-			response.BadRequest(c, "cannot remove the last owner")
-			return
-		}
-		response.Internal(c, err)
+	// Atomic demote: SetRoleAtomic serialises every team change so the
+	// last-owner invariant holds even under racing requests. The
+	// non-atomic "count then update" pattern that lived here previously
+	// could be tricked into zero owners by two simultaneous calls.
+	previousRole, changed, err := h.Store.SetRoleAtomic(c, actorUser.ID, targetID, model.RoleUser)
+	if err != nil {
+		teamRoleError(c, err)
+		return
+	}
+	if !changed {
+		// A concurrent request removed them first; it wrote the audit entry.
+		response.OK(c, gin.H{"status": "removed"})
 		return
 	}
 
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "team", EntityID: targetID, Action: "member_removed",
 		ActorType: "admin", ActorID: adminID(c),
-		Changes: map[string]any{"email": target.Email, "previous_role": target.Role},
+		Changes: map[string]any{"email": target.Email, "previous_role": previousRole},
 	})
 
 	response.OK(c, gin.H{"status": "removed"})

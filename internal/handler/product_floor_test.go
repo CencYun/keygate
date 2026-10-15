@@ -3,10 +3,8 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -85,36 +83,8 @@ func TestMinimumSupportedMessageNeedsVersion(t *testing.T) {
 // no checkout id, created_at in year 1). Setup runs once per database,
 // so this test makes a database of its own.
 func TestSetupAnswersStoredRows(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("skipping integration test: TEST_DATABASE_URL not set")
-	}
-	admin, err := store.New(dsn)
-	if err != nil {
-		t.Skipf("skipping integration test: %v", err)
-	}
-	defer admin.Close()
+	s := scratchStore(t)
 	ctx := context.Background()
-	name := fmt.Sprintf("keygate_setup_test_%d", time.Now().UnixNano())
-	if _, err := admin.DB.ExecContext(ctx, "CREATE DATABASE "+name); err != nil {
-		t.Skipf("cannot create a scratch database: %v", err)
-	}
-	defer func() {
-		_, _ = admin.DB.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
-	}()
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	u.Path = "/" + name
-	s, err := store.New(u.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	if err := s.RunMigrations("../../db/migrations"); err != nil {
-		t.Fatalf("migrations: %v", err)
-	}
 
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
@@ -122,7 +92,7 @@ func TestSetupAnswersStoredRows(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/setup/initialize", strings.NewReader(
 		`{"admin_email":"owner@example.com","admin_name":"Owner","site_name":"Acme","product_name":"Acme App","product_slug":"acme-app","product_type":"desktop"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
-	NewSetupHandler(s).Initialize(c)
+	NewSetupHandler(s, nil).Initialize(c)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("setup: %d %s", w.Code, w.Body.String())
 	}
