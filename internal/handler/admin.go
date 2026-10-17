@@ -2994,13 +2994,15 @@ func analyticsFilter(c *gin.Context) store.AnalyticsFilter {
 
 // endOfDay parses a "to" date (YYYY-MM-DD) as the last instant of that
 // day, so a `created_at <= to` filter includes the whole date rather
-// than stopping at its midnight.
+// than stopping at its midnight. The last instant is stated to the
+// microsecond, the precision bun writes times at and Postgres keeps, so
+// the bound compared is exactly this value.
 func endOfDay(v string) (time.Time, bool) {
 	t, err := time.Parse("2006-01-02", v)
 	if err != nil {
 		return time.Time{}, false
 	}
-	return t.Add(24*time.Hour - time.Nanosecond), true
+	return t.Add(24*time.Hour - time.Microsecond), true
 }
 
 func (h *AdminHandler) AnalyticsSummary(c *gin.Context) {
@@ -3033,7 +3035,9 @@ func (h *AdminHandler) AnalyticsUsageTop(c *gin.Context) {
 		from, _ = time.Parse("2006-01-02", v)
 	}
 	if v := c.Query("to"); v != "" {
-		to, _ = time.Parse("2006-01-02", v)
+		// Usage is compared by timestamp: a midnight bound would drop the
+		// whole "to" day, usually today.
+		to, _ = endOfDay(v)
 	}
 	limit := queryInt(c, "limit", 10)
 	features, err := h.Store.GetTopFeatureUsage(c, productID, from, to, limit)

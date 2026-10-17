@@ -402,14 +402,17 @@ func (s *Store) GetTopFeatureUsage(ctx context.Context, productID string, from, 
 	return out, err
 }
 
+// GetActivationTrend counts activations per UTC day. The from/to bounds
+// are UTC days too; bucketing by the session's time zone instead would
+// shift every bar on a database not set to UTC.
 func (s *Store) GetActivationTrend(ctx context.Context, productID string, from, to time.Time) ([]TrendPoint, error) {
 	var out []TrendPoint
 	q := s.DB.NewSelect().
 		TableExpr("activations AS a").
-		ColumnExpr("DATE(a.created_at)::text AS date").
+		ColumnExpr("to_char(DATE(a.created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS date").
 		ColumnExpr("COUNT(*)::int AS count").
-		GroupExpr("DATE(a.created_at)").
-		OrderExpr("DATE(a.created_at) ASC")
+		GroupExpr("DATE(a.created_at AT TIME ZONE 'UTC')").
+		OrderExpr("DATE(a.created_at AT TIME ZONE 'UTC') ASC")
 
 	if productID != "" {
 		q = q.Join("JOIN licenses AS l ON l.id = a.license_id").

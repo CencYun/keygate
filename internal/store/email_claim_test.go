@@ -306,14 +306,6 @@ func TestCreateLicenseHoldsTheMaintenanceSwitch(t *testing.T) {
 	}
 	testsupport.LockSettings(t, s.DB)
 	ctx := context.Background()
-	prev, _ := s.GetSetting(ctx, SettingMaintenanceFeatures)
-	defer func() {
-		if prev != "" {
-			if err := s.SetSettings(ctx, map[string]string{SettingMaintenanceFeatures: prev}); err != nil {
-				t.Errorf("restore the switch: %v", err)
-			}
-		}
-	}()
 	suffix := time.Now().Format("150405.000000")
 	drained := time.Now().Add(-30 * 24 * time.Hour)
 	prod := &model.Product{Name: "Fence", Slug: "fence-" + suffix, Type: "desktop", FeedLicenseRequired: true, FeedGatedAt: &drained}

@@ -158,7 +158,10 @@ func TestFeedCutoff_MaintenancePeriod(t *testing.T) {
 	if err := s.CreatePlan(ctx, plan); err != nil {
 		t.Fatal(err)
 	}
-	cutoff := time.Now().Add(-10 * 24 * time.Hour)
+	// Postgres keeps microseconds; Linux clocks give nanoseconds, so an
+	// untruncated cutoff almost never compares Equal to the value read
+	// back, which is cut to the microsecond on the way in.
+	cutoff := time.Now().Add(-10 * 24 * time.Hour).Truncate(time.Microsecond)
 	for _, v := range []struct {
 		version string
 		at      time.Time

@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+
+	"github.com/tabloy/keygate/internal/testsupport"
 )
 
 func newTemplateTestService() *EmailService {
@@ -104,16 +106,9 @@ func TestValidateTemplate_RejectsRenderTimeErrors(t *testing.T) {
 // built-in one — never the raw template source.
 func TestRenderEmail_FallsBackToDefault(t *testing.T) {
 	s := openNotifyStore(t)
+	testsupport.LockSettings(t, s.DB)
 	ctx := context.Background()
 	key := "email_template_license_created"
-	prev, prevErr := s.GetSetting(ctx, key)
-	t.Cleanup(func() {
-		if prevErr != nil {
-			_ = s.DeleteSetting(ctx, key)
-		} else {
-			_ = s.SetSetting(ctx, key, prev)
-		}
-	})
 	if err := s.SetSetting(ctx, key, `{{if .DownloadURL}}<a href="{{.DownloadURL}}{{end}}">{{.LicenseKey}}</a>`); err != nil {
 		t.Fatal(err)
 	}

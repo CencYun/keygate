@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tabloy/keygate/internal/model"
+	"github.com/tabloy/keygate/internal/testsupport"
 )
 
 // A Stripe session carries its created time in whole seconds, so a
@@ -66,7 +67,15 @@ func TestPlanUpdateTermsTakeEffectOnASecondBoundary(t *testing.T) {
 		t.Fatalf("a session stamped in the creation second: got %d (known=%v, %v) want 90", days, known, err)
 	}
 
-	// Two edits inside the same second.
+	// Two edits inside the same second. They are stamped by the
+	// database clock, so start them just after that clock turns a
+	// second: begun at a random moment, the pair now and then straddled
+	// a boundary and the test failed.
+	var toNextSecond float64
+	if err := s.DB.NewRaw("SELECT ceil(extract(epoch FROM clock_timestamp())) - extract(epoch FROM clock_timestamp())").Scan(ctx, &toNextSecond); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Duration(toNextSecond*float64(time.Second)) + 20*time.Millisecond)
 	for _, days := range []int{180, 30} {
 		plan.UpdatesDays = days
 		if err := s.UpdatePlan(ctx, plan); err != nil {
@@ -109,6 +118,7 @@ func TestCreateLicenseRefusesARetypedPlan(t *testing.T) {
 	if err := s.RunMigrations("../../db/migrations"); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
+	testsupport.SetSetting(t, s.DB, SettingMaintenanceFeatures, "true")
 	ctx := context.Background()
 	suffix := time.Now().Format("150405.000000")
 	// Gated and long drained: the retyped plan sells an update period.
@@ -302,6 +312,7 @@ func TestFeedURLTTLBound(t *testing.T) {
 	if err := s.RunMigrations("../../db/migrations"); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
+	testsupport.LockSettings(t, s.DB)
 	ctx := context.Background()
 	key := "test_ttl_bound_" + time.Now().Format("150405.000000")
 	defer func() {

@@ -16,6 +16,7 @@ import (
 
 	"github.com/tabloy/keygate/internal/crypto"
 	"github.com/tabloy/keygate/internal/store"
+	"github.com/tabloy/keygate/internal/testsupport"
 )
 
 // A 32-byte test key for the settings AEAD.
@@ -40,6 +41,8 @@ func providerTestStore(t *testing.T) *store.Store {
 	}
 	db.LicenseKeyAEAD = testAEAD(t)
 	t.Cleanup(func() { db.Close() })
+	// Most callers write the email settings.
+	testsupport.LockSettings(t, db.DB)
 	return db
 }
 
@@ -230,6 +233,7 @@ func TestQueueDoesNotMarkUndeliverableMailSent(t *testing.T) {
 		t.Fatalf("configure: %v", err)
 	}
 
+	holdBackQueuedMail(t, db)
 	to := "queue-undeliverable-" + time.Now().Format("150405.000000") + "@example.com"
 	body := `<html><body>KG-QUEUEKEY-QUEUEKEY-QUEUEKEY-QUEUE</body></html>`
 	if err := db.EnqueueEmail(ctx, to, "Your license", body); err != nil {
@@ -241,11 +245,14 @@ func TestQueueDoesNotMarkUndeliverableMailSent(t *testing.T) {
 	svc.processQueue(ctx, db)
 
 	var status string
-	var bodyLen int
+	var bodyLen, attempts int
 	if err := db.DB.NewRaw(
-		"SELECT status, length(body) FROM email_queue WHERE to_addr = ?", to,
-	).Scan(ctx, &status, &bodyLen); err != nil {
+		"SELECT status, length(body), attempts FROM email_queue WHERE to_addr = ?", to,
+	).Scan(ctx, &status, &bodyLen, &attempts); err != nil {
 		t.Fatalf("read back: %v", err)
+	}
+	if attempts < 1 {
+		t.Fatalf("the queue never tried this mail (attempts %d), so the checks below would prove nothing", attempts)
 	}
 	if status == "sent" {
 		t.Error("undeliverable mail was marked sent")
@@ -284,6 +291,7 @@ func TestSecretRefusedWithoutEncryptionKey(t *testing.T) {
 		t.Skipf("store: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
+	testsupport.LockSettings(t, db.DB)
 	db.LicenseKeyAEAD = nil // no master key configured
 	ctx := context.Background()
 	_ = db.DeleteSetting(ctx, "smtp_password")
@@ -442,6 +450,7 @@ func TestQueueMarksPermanentFailureTerminal(t *testing.T) {
 		t.Fatalf("configure: %v", err)
 	}
 	to := "queue-permanent-" + time.Now().Format("150405.000000") + "@example.com"
+	holdBackQueuedMail(t, db)
 	if err := db.EnqueueEmail(ctx, to, "Your license", "<html><body>KG-PERMKEY-PERMKEY-PERMKEY-PERM</body></html>"); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
@@ -494,6 +503,7 @@ func TestQueueKeepsConfigErrorForRetry(t *testing.T) {
 		t.Fatalf("configure: %v", err)
 	}
 	to := "queue-config-" + time.Now().Format("150405.000000") + "@example.com"
+	holdBackQueuedMail(t, db)
 	if err := db.EnqueueEmail(ctx, to, "Your license", "<html><body>KG-CFGKEY-CFGKEY-CFGKEY-CFGK</body></html>"); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
@@ -502,10 +512,13 @@ func TestQueueKeepsConfigErrorForRetry(t *testing.T) {
 	svc := &EmailService{logger: slog.Default(), store: db}
 	svc.processQueue(ctx, db)
 
-	var status string
+	var status, lastErr string
 	var bodyLen int
-	if err := db.DB.NewRaw("SELECT status, length(body) FROM email_queue WHERE to_addr = ?", to).Scan(ctx, &status, &bodyLen); err != nil {
+	if err := db.DB.NewRaw("SELECT status, length(body), error FROM email_queue WHERE to_addr = ?", to).Scan(ctx, &status, &bodyLen, &lastErr); err != nil {
 		t.Fatalf("read back: %v", err)
+	}
+	if lastErr == "" {
+		t.Fatal("the queue never tried this mail (no error recorded), so the checks below would prove nothing")
 	}
 	if status == "failed" {
 		t.Error("a config error was marked terminal; the mail is lost on token rotation")
@@ -515,5 +528,21 @@ func TestQueueKeepsConfigErrorForRetry(t *testing.T) {
 	}
 	if bodyLen == 0 {
 		t.Error("config-error mail had its body wiped; fixing the token cannot recover it")
+	}
+}
+
+// holdBackQueuedMail pushes pending mail already in the queue a day into
+// the future, so a test that runs the queue claims only its own mail.
+// The test database is shared with other packages' tests, whose leftover
+// mail is older and so claimed first, and a pass takes at most
+// emailQueueBatch mails: with that many left over, the test's own mail
+// was never tried, and its checks passed whatever the queue did.
+// Leftovers are not restored afterwards, or the next queue test would
+// claim them instead.
+func holdBackQueuedMail(t *testing.T, db *store.Store) {
+	t.Helper()
+	if _, err := db.DB.ExecContext(context.Background(), `UPDATE email_queue SET next_retry = now() + interval '1 day'
+		WHERE status = 'pending' AND (next_retry IS NULL OR next_retry <= now())`); err != nil {
+		t.Fatalf("hold back queued mail: %v", err)
 	}
 }

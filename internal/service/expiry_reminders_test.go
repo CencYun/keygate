@@ -74,15 +74,8 @@ type reminderFixture struct {
 func newReminderFixture(t *testing.T) *reminderFixture {
 	s := openNotifyStore(t)
 	ctx := context.Background()
+	// setNotify takes the settings lock, which puts both rows back.
 	setNotify(t, s, "license_expiring", "")
-	prevDays, prevErr := s.GetSetting(ctx, ReminderDaysSetting)
-	t.Cleanup(func() {
-		if prevErr != nil {
-			_ = s.DeleteSetting(ctx, ReminderDaysSetting)
-		} else {
-			_ = s.SetSetting(ctx, ReminderDaysSetting, prevDays)
-		}
-	})
 	_ = s.DeleteSetting(ctx, ReminderDaysSetting) // default 7,3,1
 
 	suffix := time.Now().Format("150405.000000")

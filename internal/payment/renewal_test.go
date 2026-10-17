@@ -798,6 +798,7 @@ func TestCheckoutByPlan_BoundedPlanNeedsTheSwitch(t *testing.T) {
 func TestFulfillCheckout_UpdatePeriodFrozenAtCheckout(t *testing.T) {
 	s, ctx := openStore(t)
 	defer s.Close()
+	testsupport.SetSetting(t, s.DB, store.SettingMaintenanceFeatures, "true")
 	bounded := seedMaintenancePlan(t, s, ctx, "frozen")
 	h := &StripeHandler{Store: s}
 	meta := func(session, planID string, days *int) map[string]string {
@@ -862,6 +863,7 @@ func TestFulfillCheckout_UpdatePeriodFrozenAtCheckout(t *testing.T) {
 func TestFulfillCheckout_UnmanagedSessionUsesTermsAtCheckout(t *testing.T) {
 	s, ctx := openStore(t)
 	defer s.Close()
+	testsupport.SetSetting(t, s.DB, store.SettingMaintenanceFeatures, "true")
 	plan := seedMaintenancePlan(t, s, ctx, "plink")
 	h := &StripeHandler{Store: s}
 	period := func(email string) *time.Time {
@@ -959,6 +961,7 @@ func TestFulfillCheckout_UnmanagedSessionUsesTermsAtCheckout(t *testing.T) {
 func TestFulfillCheckout_UngatedProductLeavesTheSalePending(t *testing.T) {
 	s, ctx := openStore(t)
 	defer s.Close()
+	testsupport.SetSetting(t, s.DB, store.SettingMaintenanceFeatures, "true")
 	plan := seedMaintenancePlan(t, s, ctx, "ungate")
 	h := &StripeHandler{Store: s}
 	// The merchant stops selling a period and takes the gate off.
@@ -1009,6 +1012,7 @@ func TestFulfillCheckout_UngatedProductLeavesTheSalePending(t *testing.T) {
 func TestFulfillCheckout_DrainingProductWaitsForTheLinksToExpire(t *testing.T) {
 	s, ctx := openStore(t)
 	defer s.Close()
+	testsupport.SetSetting(t, s.DB, store.SettingMaintenanceFeatures, "true")
 	plan := seedMaintenancePlan(t, s, ctx, "drain")
 	h := &StripeHandler{Store: s}
 	rel := &model.Release{ProductID: plan.ProductID, Version: "1.0.0", Channel: model.ReleaseChannelStable}
@@ -1098,14 +1102,6 @@ func TestFulfillCheckout_SwitchOffLeavesABoundedSalePending(t *testing.T) {
 	defer s.Close()
 	plan := seedMaintenancePlan(t, s, ctx, "swoff")
 	h := &StripeHandler{Store: s}
-	prev, _ := s.GetSetting(ctx, store.SettingMaintenanceFeatures)
-	defer func() {
-		if prev != "" {
-			if err := s.SetSettings(ctx, map[string]string{store.SettingMaintenanceFeatures: prev}); err != nil {
-				t.Errorf("restore the switch: %v", err)
-			}
-		}
-	}()
 	if err := s.SetSettings(ctx, map[string]string{store.SettingMaintenanceFeatures: "false"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1147,6 +1143,7 @@ func TestFulfillCheckout_SwitchOffLeavesABoundedSalePending(t *testing.T) {
 func TestFulfillCheckout_RetypedPlanLeavesTheSalePending(t *testing.T) {
 	s, ctx := openStore(t)
 	defer s.Close()
+	testsupport.SetSetting(t, s.DB, store.SettingMaintenanceFeatures, "true")
 	plan := seedMaintenancePlan(t, s, ctx, "retyped")
 	h := &StripeHandler{Store: s}
 	// The plan the customer bought was perpetual with a period; it is
@@ -1192,6 +1189,7 @@ func TestFulfillCheckout_RetypedPlanLeavesTheSalePending(t *testing.T) {
 func TestFulfillCheckout_BlankFrozenTypeIsNotAMismatch(t *testing.T) {
 	s, ctx := openStore(t)
 	defer s.Close()
+	testsupport.SetSetting(t, s.DB, store.SettingMaintenanceFeatures, "true")
 	plan := seedMaintenancePlan(t, s, ctx, "blanktype")
 	h := &StripeHandler{Store: s}
 	meta := map[string]string{
@@ -1219,6 +1217,7 @@ func TestFulfillCheckout_BlankFrozenTypeIsNotAMismatch(t *testing.T) {
 func TestFulfillCheckout_UnmanagedSessionChecksTheSoldKind(t *testing.T) {
 	s, ctx := openStore(t)
 	defer s.Close()
+	testsupport.SetSetting(t, s.DB, store.SettingMaintenanceFeatures, "true")
 	plan := seedMaintenancePlan(t, s, ctx, "mode")
 	h := &StripeHandler{Store: s}
 	// Bought as a one-off perpetual purchase through a Payment Link;

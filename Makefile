@@ -55,9 +55,10 @@ lint: ## Lint all code
 	$(GO) vet ./...
 	cd web && $(BUN) run lint 2>/dev/null || true
 
+# One package at a time, as in CI: the integration tests share a database.
 .PHONY: test
-test: ## Run all tests
-	$(GO) test ./...
+test: ## Run all tests (integration tests too when TEST_DATABASE_URL is set)
+	$(GO) test -p 1 ./...
 
 .PHONY: check
 check: lint test build ## Full CI check (lint + test + build)

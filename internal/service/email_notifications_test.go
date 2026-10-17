@@ -9,6 +9,7 @@ import (
 
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/store"
+	"github.com/tabloy/keygate/internal/testsupport"
 )
 
 func openNotifyStore(t *testing.T) *store.Store {
@@ -28,20 +29,14 @@ func openNotifyStore(t *testing.T) *store.Store {
 	return s
 }
 
-// setNotify writes (or with value "" removes) an email switch and puts
-// the original state back when the test ends: the settings are global.
+// setNotify writes (or with value "" removes) an email switch. The
+// settings lock puts the original state back when the test ends: the
+// settings are global.
 func setNotify(t *testing.T, s *store.Store, kind, value string) {
 	t.Helper()
+	testsupport.LockSettings(t, s.DB)
 	ctx := context.Background()
 	key := NotifySettingKey(kind)
-	prev, prevErr := s.GetSetting(ctx, key)
-	t.Cleanup(func() {
-		if prevErr != nil {
-			_ = s.DeleteSetting(ctx, key)
-		} else {
-			_ = s.SetSetting(ctx, key, prev)
-		}
-	})
 	if value == "" {
 		_ = s.DeleteSetting(ctx, key)
 		return

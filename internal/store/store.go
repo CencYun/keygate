@@ -33,6 +33,8 @@ type Store struct {
 	// feedTTL is how long this install signs the presigned links
 	// inside a public feed for; see SetFeedURLTTL.
 	feedTTL time.Duration
+	// dsn opens the pool RunMigrations uses; see migrationDB.
+	dsn string
 }
 
 func New(dsn string) (*Store, error) {
@@ -46,10 +48,43 @@ func New(dsn string) (*Store, error) {
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("ping: %w", err)
 	}
-	return &Store{DB: db}, nil
+	return &Store{DB: db, dsn: dsn}, nil
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
+
+const (
+	// migrationLockWait is how long RunMigrations waits for another
+	// instance to finish its migrations before giving up.
+	migrationLockWait = 10 * time.Minute
+	// migrationTimeout bounds each statement of a migration, and with
+	// migrationGrace the whole of one migration file.
+	migrationTimeout = 5 * time.Minute
+	// migrationGrace is how much longer the client waits than the server
+	// is told to, so the server's own timeout ends a statement or a lock
+	// wait first. A client deadline does not end it: the driver only
+	// closes its socket, and the backend runs on, or stays queued for the
+	// lock, after the client has given up.
+	migrationGrace = 30 * time.Second
+)
+
+// migrationDB opens the connection RunMigrations holds its lock and
+// applies migrations on. The driver bounds every read, at 10 seconds by
+// default, deadline or not, which the store's pool keeps for ordinary
+// queries; here it would fail any migration longer than that, an index
+// on a large table say, and any wait for another instance's run. This
+// one waits as long as the longest of those, so that a read that never
+// returns, a COMMIT say, still ends; lock_timeout, statement_timeout and
+// the contexts RunMigrations sets are what end the rest.
+func (s *Store) migrationDB() (*bun.DB, error) {
+	if s.dsn == "" {
+		return nil, errors.New("run migrations: store not opened with New")
+	}
+	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(s.dsn),
+		pgdriver.WithReadTimeout(migrationLockWait+migrationGrace)))
+	sqldb.SetMaxOpenConns(1)
+	return bun.NewDB(sqldb, pgdialect.New()), nil
+}
 
 // RunMigrations executes all .up.sql files from the migrations directory in order.
 // Guarantees:
@@ -78,11 +113,52 @@ func (s *Store) RunMigrations(dir string) error {
 
 	// Acquire advisory lock to prevent concurrent migration across instances.
 	// Lock ID 7367616 = crc32("keygate_migrations") — unique per application.
-	if _, err := s.DB.ExecContext(ctx, "SELECT pg_advisory_lock(7367616)"); err != nil {
+	// The lock belongs to a session, so it is taken, held and released on
+	// one pinned connection, and the migrations run on that connection
+	// too. Through the pool, the lock lived on whichever connection ran
+	// the statement: the pool closes a connection that outlives
+	// ConnMaxLifetime, which dropped the lock partway through a long run,
+	// and an unlock could land on another connection, leaving the lock
+	// held by an idle one. Running the migrations on the lock's session
+	// means the lock cannot end while one still runs: a session the
+	// server ends (idle_session_timeout, a dropped connection) ends the
+	// migration with it, and a migration whose client gave up keeps the
+	// lock until its backend has finished.
+	mdb, err := s.migrationDB()
+	if err != nil {
+		return err
+	}
+	defer mdb.Close()
+	// The context covers connecting too, which the pool leaves unbounded.
+	lockCtx, cancelLock := context.WithTimeout(ctx, migrationLockWait+migrationGrace)
+	defer cancelLock()
+	lockConn, err := mdb.Conn(lockCtx)
+	if err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer lockConn.Close()
+	// lock_timeout alone bounds the wait: a statement_timeout set for the
+	// role or database would otherwise cut it short.
+	if _, err := lockConn.ExecContext(lockCtx, fmt.Sprintf("SET lock_timeout = %d; SET statement_timeout = 0", migrationLockWait.Milliseconds())); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	if _, err := lockConn.ExecContext(lockCtx, "SELECT pg_advisory_lock(7367616)"); err != nil {
+		if isLockTimeout(err) {
+			return fmt.Errorf("acquire migration lock: another instance has been migrating for over %v: %w", migrationLockWait, err)
+		}
 		return fmt.Errorf("acquire migration lock: %w", err)
 	}
 	defer func() {
-		_, _ = s.DB.ExecContext(ctx, "SELECT pg_advisory_unlock(7367616)")
+		unlockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		var released bool
+		if err := lockConn.NewRaw("SELECT pg_advisory_unlock(7367616)").Scan(unlockCtx, &released); err != nil {
+			slog.Warn("release migration lock", "error", err)
+		} else if !released {
+			// Another session answered, as behind a pooler in transaction
+			// mode, which session locks do not survive.
+			slog.Warn("release migration lock: not held by this session")
+		}
 	}()
 
 	// Verify checksums of previously applied migrations
@@ -90,7 +166,11 @@ func (s *Store) RunMigrations(dir string) error {
 		Filename string `bun:"filename"`
 		Checksum string `bun:"checksum"`
 	}
-	_ = s.DB.NewRaw("SELECT filename, checksum FROM schema_migrations ORDER BY filename").Scan(ctx, &existing)
+	// A failed read must not pass for "none applied", which would run
+	// every migration again.
+	if err := s.DB.NewRaw("SELECT filename, checksum FROM schema_migrations ORDER BY filename").Scan(ctx, &existing); err != nil {
+		return fmt.Errorf("read applied migrations: %w", err)
+	}
 	checksumMap := make(map[string]string, len(existing))
 	for _, e := range existing {
 		checksumMap[e.Filename] = e.Checksum
@@ -121,10 +201,15 @@ func (s *Store) RunMigrations(dir string) error {
 		}
 
 		// Apply migration: SQL execution + tracking record in ONE transaction
-		migCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		migCtx, cancel := context.WithTimeout(ctx, migrationTimeout+migrationGrace)
 
-		tx, err := s.DB.BeginTx(migCtx, nil)
+		tx, err := lockConn.BeginTx(migCtx, nil)
 		if err != nil {
+			cancel()
+			return fmt.Errorf("begin tx for %s: %w", entry.Name(), err)
+		}
+		if _, err := tx.ExecContext(migCtx, fmt.Sprintf("SET LOCAL statement_timeout = %d", migrationTimeout.Milliseconds())); err != nil {
+			_ = tx.Rollback()
 			cancel()
 			return fmt.Errorf("begin tx for %s: %w", entry.Name(), err)
 		}

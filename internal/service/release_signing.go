@@ -241,9 +241,9 @@ func (s *ReleaseSigningService) ExportPublicKeyTauri(ctx context.Context, produc
 //
 // Format:
 //
-//	-----BEGIN PUBLIC KEY-----
+//	-----BEGIN ED25519 PUBLIC KEY-----
 //	<base64 of raw 32-byte key>
-//	-----END PUBLIC KEY-----
+//	-----END ED25519 PUBLIC KEY-----
 //
 // We use a custom block type rather than SPKI because Sparkle's edSignature
 // docs recommend the raw 32-byte key, not the X.509 envelope.

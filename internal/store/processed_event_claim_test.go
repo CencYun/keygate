@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/tabloy/keygate/internal/testsupport"
 )
 
 // TestClaimProcessedEvent separates the three outcomes callers must
@@ -62,6 +64,7 @@ func TestSetSettings_Atomic(t *testing.T) {
 	if err := s.RunMigrations("../../db/migrations"); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
+	testsupport.LockSettings(t, s.DB)
 	ctx := context.Background()
 	tag := time.Now().Format("150405.000")
 	k1, k2 := "test_atomic_a_"+tag, "test_atomic_b_"+tag

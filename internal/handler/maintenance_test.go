@@ -1416,27 +1416,11 @@ func TestFeedDrainFollowsTheRecordedBound(t *testing.T) {
 	if err := s.RunMigrations("../../db/migrations"); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
+	// The test ends by recording an unreadable bound; the lock puts the
+	// setting back, or every later test reading it inherits the 500.
+	testsupport.LockSettings(t, s.DB)
 	ctx := context.Background()
-	// The test ends by recording an unreadable bound; leave the setting
-	// as it found it, or every later test reading it inherits the 500.
-	before, _ := s.GetSetting(ctx, store.SettingFeedURLTTLBound)
-	// A defer, not t.Cleanup: it must run before the deferred s.Close.
-	defer func() {
-		if before != "" {
-			_ = s.SetSettings(context.Background(), map[string]string{store.SettingFeedURLTTLBound: before})
-			return
-		}
-		_, _ = s.DB.NewRaw("DELETE FROM settings WHERE key = ?", store.SettingFeedURLTTLBound).Exec(context.Background())
-	}()
 	gin.SetMode(gin.TestMode)
-	prevBound, _ := s.GetSetting(ctx, store.SettingFeedURLTTLBound)
-	defer func() {
-		if prevBound != "" {
-			if err := s.SetSettings(ctx, map[string]string{store.SettingFeedURLTTLBound: prevBound}); err != nil {
-				t.Errorf("restore the bound: %v", err)
-			}
-		}
-	}()
 	suffix := time.Now().Format("150405.000")
 	// Gated two hours ago, with a release the public feed served.
 	gated := time.Now().Add(-2 * time.Hour)
@@ -1504,16 +1488,9 @@ func TestFeedURLTTLBoundIsValidated(t *testing.T) {
 	if err := s.RunMigrations("../../db/migrations"); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
+	testsupport.LockSettings(t, s.DB)
 	ctx := context.Background()
 	gin.SetMode(gin.TestMode)
-	before, _ := s.GetSetting(ctx, store.SettingFeedURLTTLBound)
-	defer func() {
-		if before != "" {
-			if err := s.SetSettings(ctx, map[string]string{store.SettingFeedURLTTLBound: before}); err != nil {
-				t.Errorf("restore: %v", err)
-			}
-		}
-	}()
 	h := &AdminHandler{Store: s, FeedURLTTL: time.Hour}
 	save := func(value string) int {
 		w := httptest.NewRecorder()

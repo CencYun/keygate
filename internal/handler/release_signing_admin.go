@@ -140,6 +140,8 @@ func (h *ReleaseSigningAdminHandler) DownloadPublicKey(c *gin.Context) {
 		switch {
 		case errors.Is(err, service.ErrSigningKeyMissing):
 			response.NotFound(c, "no active signing key for this product — generate one first")
+		case errors.Is(err, service.ErrSigningDisabled):
+			response.Err(c, http.StatusServiceUnavailable, "SIGNING_DISABLED", service.ErrSigningDisabled.Error())
 		default:
 			response.Internal(c, err)
 		}
@@ -166,6 +168,8 @@ func (h *ReleaseSigningAdminHandler) DownloadPublicKeyTauri(c *gin.Context) {
 		switch {
 		case errors.Is(err, service.ErrSigningKeyMissing):
 			response.NotFound(c, "no active signing key for this product — generate one first")
+		case errors.Is(err, service.ErrSigningDisabled):
+			response.Err(c, http.StatusServiceUnavailable, "SIGNING_DISABLED", service.ErrSigningDisabled.Error())
 		default:
 			response.Internal(c, err)
 		}

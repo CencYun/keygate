@@ -45,13 +45,14 @@ jobs:
       - name: Lint
         run: go vet ./...
 
-      - name: Unit tests
-        run: go test ./... -count=1
-
-      - name: Integration tests
+      # Unit and integration tests together, against the postgres service.
+      # Without TEST_DATABASE_URL the integration tests skip themselves,
+      # so CI ran almost none of them. -p 1 runs one package at a time:
+      # every package shares this database.
+      - name: Tests
         env:
           TEST_DATABASE_URL: postgres://keygate:keygate@localhost:5432/keygate?sslmode=disable
-        run: go test -count=1 -run "Atomic" ./internal/store/
+        run: go test -p 1 -count=1 ./...
 
       - name: Build
         run: go build -o /dev/null ./cmd/server
