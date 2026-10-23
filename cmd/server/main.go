@@ -414,6 +414,10 @@ func main() {
 	// Initialize thread-safe webhook secret with config value
 	stripeH.SetWebhookSecret(cfg.StripeWebhookSecret)
 	expiryChecker := service.NewExpiryChecker(db, emailSvc, webhookSvc, logger)
+	if cfg.StripeSecretKey != "" {
+		expiryChecker.EndPastDueUpgrade = stripeH.EndPastDueUpgrade
+		expiryChecker.EndGraceExpiredUpgrade = stripeH.EndGraceExpiredUpgrade
+	}
 	meteredSyncer := service.NewMeteredBillingSyncer(db, logger)
 	adminH := handler.NewAdminHandler(db, webhookSvc, emailSvc, expiryChecker, meteredSyncer)
 	// An update period may only be written once the links a public
@@ -892,10 +896,18 @@ func main() {
 			type portalLicense struct {
 				*model.License
 				LicenseKey string `json:"license_key"`
+				// Upgradable says the owner can upgrade it to a paid
+				// plan now (see StripeHandler.UpgradableLicenses).
+				Upgradable bool `json:"upgradable"`
+			}
+			upgradable, err := stripeH.UpgradableLicenses(c, emailStr, licenses)
+			if err != nil {
+				response.Internal(c, err)
+				return
 			}
 			out := make([]portalLicense, 0, len(licenses))
 			for _, l := range licenses {
-				out = append(out, portalLicense{License: l, LicenseKey: db.DecryptLicenseKey(l)})
+				out = append(out, portalLicense{License: l, LicenseKey: db.DecryptLicenseKey(l), Upgradable: upgradable[l.ID]})
 			}
 			// The portal hides the renewal button while the switch is
 			// off; the endpoint refuses the sale regardless.
@@ -967,6 +979,9 @@ func main() {
 						"id": p.ID, "name": p.Name, "slug": p.Slug,
 						"license_type": p.LicenseType, "billing_interval": p.BillingInterval,
 						"stripe_price_id": p.StripePriceID, "checkout_id": p.CheckoutID,
+						// The portal's upgrade offers no plan selling an
+						// update period; it needs this to leave them out.
+						"updates_days": p.UpdatesDays,
 					})
 				}
 			}
@@ -1122,6 +1137,7 @@ func main() {
 		// Maintenance renewal for perpetual licenses: a one-time
 		// checkout that extends updates_until.
 		portal.POST("/updates/renew", stripeH.RenewUpdates)
+		portal.POST("/licenses/upgrade", stripeH.StartUpgrade)
 	}
 
 	// Admin route layout: three groups under /admin, all sharing the

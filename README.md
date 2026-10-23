@@ -70,6 +70,8 @@ Stripe integrated end-to-end with **three-layer reliability** — webhook, succe
 
 Free plans can take **self sign-up**: the plan's `/pay` link becomes a form where a visitor confirms their email with a login code and gets a license key, one per address per product, with an optional daily cap and marketing-consent checkbox (reported in the `license.created` webhook). No card, no Stripe customer.
 
+A license on a free plan shows **Upgrade** in the portal: the customer pays for a paid plan of the same product through checkout, and that same license moves to it — same key, same activations, no re-install. A full refund, or the end of the subscription, puts it back on the free plan instead of revoking it.
+
 ### 👥 Team Seats & Entitlements
 
 Customers manage their own teams within a license. Seat roles (owner/admin/member), configurable limits per plan. Feature entitlements as boolean flags, numeric limits, or usage quotas. Purchasable add-ons that extend plan capabilities.

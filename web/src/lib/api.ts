@@ -247,6 +247,9 @@ export const portal = {
   getInvoices: (licenseId: string) =>
     get<{ invoices: Invoice[] }>(`/portal/subscription/invoices?license_id=${licenseId}`),
   renewUpdates: (data: { license_id: string }) => post<{ url: string }>("/portal/updates/renew", data),
+  // Moves a licence Stripe doesn't bill (a free plan's) to a paid plan
+  // through checkout; the licence keeps its key.
+  upgrade: (data: { license_id: string; plan_id: string }) => post<{ url: string }>("/portal/licenses/upgrade", data),
 }
 
 // ─── Admin ───
@@ -744,6 +747,8 @@ export interface License {
 // endpoints. Admin payloads never carry it.
 export interface PortalLicense extends License {
   license_key: string
+  // The owner can upgrade it to a paid plan now, keeping the key.
+  upgradable?: boolean
 }
 
 export interface Activation {

@@ -525,6 +525,9 @@ const zh = {
   "checkout.error": "无法验证付款。您的许可证将稍后通过邮件发送。",
   "checkout.viewLicense": "查看我的许可证",
   "checkout.renewalSuccess": "更新期已延长。",
+  "checkout.upgradeSuccess": "您的许可证已升级，密钥保持不变。",
+  "checkout.processing": "已收到您的付款，正在处理中。请过几分钟再查看您的许可证。",
+  "checkout.upgradeNotApplied": "升级未应用到此许可证。如果您已被扣款，请联系我们。",
   "checkout.backToPortal": "返回我的许可证",
 
   // Self sign-up
@@ -592,6 +595,9 @@ const zh = {
   "portal.invoices": "账单记录",
   "portal.changePlanDesc": "选择新方案。变更立即生效，按比例计费。",
   "portal.noOtherPlans": "暂无其他可选方案。",
+  "portal.upgrade": "升级",
+  "portal.upgradeDesc": "选择付费方案。您将在下一页完成付款，许可证密钥保持不变。",
+  "portal.noUpgradePlans": "此产品暂无可选的付费方案。",
   "portal.confirmSwitchTitle": "切换到 {plan}？",
   "portal.confirmSwitchDesc": "切换会立即生效，差价由 Stripe 按比例计入下一张账单。",
   "portal.confirmSwitch": "确认切换",
