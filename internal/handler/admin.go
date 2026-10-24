@@ -843,6 +843,31 @@ func (h *AdminHandler) GetPlan(c *gin.Context) {
 	response.OK(c, p)
 }
 
+// PlanSeatImpact answers how many of the plan's licenses would hold more
+// people than a new max_seats allows, so the dashboard can say so before
+// an admin lowers it. A change applies to every license on the plan at
+// once; those over the limit keep their members and cannot invite more.
+//
+// GET /admin/plans/:id/seat-impact?max_seats=N → {max_seats, licenses_over}
+func (h *AdminHandler) PlanSeatImpact(c *gin.Context) {
+	maxSeats, err := strconv.Atoi(c.Query("max_seats"))
+	if err != nil || maxSeats < 0 {
+		response.BadRequest(c, "max_seats must be a whole number, 0 or more")
+		return
+	}
+	p, err := h.Store.FindPlanByID(c, c.Param("id"))
+	if err != nil {
+		response.NotFound(c, "plan not found")
+		return
+	}
+	n, err := h.Store.CountLicensesOverSeatLimit(c, p.ID, maxSeats)
+	if err != nil {
+		response.Internal(c, err)
+		return
+	}
+	response.OK(c, gin.H{"max_seats": maxSeats, "licenses_over": n})
+}
+
 // normalizeBillingInterval validates a plan's billing interval against
 // its license type. The interval is descriptive (checkout mode comes
 // from the Stripe price), so a perpetual plan carries none: it is paid
@@ -1889,6 +1914,11 @@ type planBounds struct {
 	TokenTTLDays    int // 0 = server default
 }
 
+// maxPlanSeats is the owner plus 100000 members. max_seats counts the
+// owner since migration 20261025_seats_include_owner, which raised a
+// plan at the old cap of 100000 to 100001: that plan must still save.
+const maxPlanSeats = 100001
+
 func validatePlanNumericBounds(b planBounds) error {
 	switch {
 	case b.MaxActivations < 0:
@@ -1897,8 +1927,8 @@ func validatePlanNumericBounds(b planBounds) error {
 		return fmt.Errorf("max_activations cannot exceed 10000")
 	case b.MaxSeats < 0:
 		return fmt.Errorf("max_seats cannot be negative")
-	case b.MaxSeats > 100000:
-		return fmt.Errorf("max_seats cannot exceed 100000")
+	case b.MaxSeats > maxPlanSeats:
+		return fmt.Errorf("max_seats cannot exceed %d", maxPlanSeats)
 	case b.TrialDays < 0:
 		return fmt.Errorf("trial_days cannot be negative")
 	case b.TrialDays > 365:

@@ -2069,7 +2069,9 @@ paths:
         seat with no email re-send.
 
         Cannot invite the license owner's own email (400). Enforces
-        the plan's `max_seats` (409 SEAT_LIMIT). When a seat is
+        the plan's `max_seats`, which counts the owner: with
+        `max_seats: 5` the owner invites four members, and with 1 none
+        (409 SEAT_LIMIT, where `current` counts the owner too). When a seat is
         added, an invite email goes to the recipient and the
         `seat.added` webhook fires; they accept via `/invites/accept`.
         The body is capped at 64 KiB.
@@ -2116,7 +2118,7 @@ paths:
           description: "`LICENSE_NOT_FOUND`: unknown or unusable license, a product without seats, or the caller lacks mutation rights"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "409":
-          description: "Seat limit reached (`SEAT_LIMIT`, `details: {max, current}`)"
+          description: "Seat limit reached (`SEAT_LIMIT`, `details: {max, current}`, both counting the owner)"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "413":
           $ref: "#/components/responses/PortalBodyTooLarge"
@@ -3510,7 +3512,10 @@ paths:
       description: |
         Requires the `admin` or `licenses:write` scope; a bound key only
         for its product's licenses. Seats that were not removed, oldest
-        first, with the count of active seats.
+        first. `active_count` is the number of members: it leaves out the
+        owner, who holds a seat without a row, and a seat at the owner's
+        own address. The people counted against `max_seats` are
+        `active_count + 1`.
       x-required-scopes: [admin, "licenses:write"]
       security:
         - BearerAuth: []

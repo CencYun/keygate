@@ -290,6 +290,9 @@ export const admin = {
   getPlan: (id: string) => get<Plan>(`/admin/plans/${id}`),
   createPlan: (data: Partial<Plan>) => post<Plan>("/admin/plans", data),
   updatePlan: (id: string, data: Partial<Plan>) => put<Plan>(`/admin/plans/${id}`, data),
+  // How many of the plan's licenses would hold more people than maxSeats.
+  planSeatImpact: (id: string, maxSeats: number) =>
+    get<{ max_seats: number; licenses_over: number }>(`/admin/plans/${id}/seat-impact?max_seats=${maxSeats}`),
   deletePlan: (id: string) => del(`/admin/plans/${id}`),
 
   createEntitlement: (data: { plan_id: string; feature: string; value_type: string; value: string }) =>

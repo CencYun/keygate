@@ -1192,6 +1192,7 @@ func main() {
 		admin.GET("/plans/:id", adminH.GetPlan)
 		admin.POST("/plans", adminH.CreatePlan)
 		admin.PUT("/plans/:id", adminH.UpdatePlan)
+		admin.GET("/plans/:id/seat-impact", adminH.PlanSeatImpact)
 		admin.DELETE("/plans/:id", adminH.DeletePlan)
 
 		admin.POST("/entitlements", adminH.CreateEntitlement)

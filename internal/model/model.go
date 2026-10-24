@@ -264,13 +264,15 @@ type Plan struct {
 	// Stripe price and no update period. SignupDailyCap limits claims
 	// per UTC day (0 = no cap); SignupConsentText, when set, is the
 	// label of an optional marketing-consent checkbox on the form.
-	SelfSignup        bool      `bun:",notnull" json:"self_signup"`
-	SignupDailyCap    int       `bun:",notnull" json:"signup_daily_cap"`
-	SignupConsentText string    `bun:",notnull" json:"signup_consent_text"`
-	MaxSeats          int       `bun:",notnull" json:"max_seats"`
-	Active            bool      `bun:",notnull,default:true" json:"active"`
-	SortOrder         int       `bun:",default:0" json:"sort_order"`
-	CreatedAt         time.Time `bun:",nullzero,default:now()" json:"created_at"`
+	SelfSignup        bool   `bun:",notnull" json:"self_signup"`
+	SignupDailyCap    int    `bun:",notnull" json:"signup_daily_cap"`
+	SignupConsentText string `bun:",notnull" json:"signup_consent_text"`
+	// MaxSeats is how many people a license holds, the owner included:
+	// 5 is the owner and four members. 0 = no limit.
+	MaxSeats  int       `bun:",notnull" json:"max_seats"`
+	Active    bool      `bun:",notnull,default:true" json:"active"`
+	SortOrder int       `bun:",default:0" json:"sort_order"`
+	CreatedAt time.Time `bun:",nullzero,default:now()" json:"created_at"`
 
 	Product      *Product       `bun:"rel:belongs-to,join:product_id=id" json:"product,omitempty"`
 	Entitlements []*Entitlement `bun:"rel:has-many,join:id=plan_id" json:"entitlements,omitempty"`

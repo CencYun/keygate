@@ -1070,7 +1070,12 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
             </TabsContent>
 
             <TabsContent value="seats" className="-mr-6 min-h-0 flex-1 overflow-y-auto pr-6">
-              <SeatsTab licenseId={id} maxSeats={lic?.plan?.max_seats || 0} />
+              <SeatsTab
+                licenseId={id}
+                maxSeats={lic?.plan?.max_seats || 0}
+                hasSeats={lic?.product?.type === "saas" || lic?.product?.type === "hybrid"}
+                ownerEmail={lic?.email ?? ""}
+              />
             </TabsContent>
           </Tabs>
         )}
@@ -1270,7 +1275,17 @@ function UsageTab({ licenseId }: { licenseId: string }) {
 // support / debugging ("how many seats has ACME used?"). Inviting
 // someone onto a customer's license from this view would let an
 // operator change a team's composition without consent.
-function SeatsTab({ licenseId, maxSeats }: { licenseId: string; maxSeats: number }) {
+function SeatsTab({
+  licenseId,
+  maxSeats,
+  hasSeats,
+  ownerEmail,
+}: {
+  licenseId: string
+  maxSeats: number
+  hasSeats: boolean
+  ownerEmail: string
+}) {
   const { t } = useI18n()
   const pg = useServerPagination(20)
   const { data, isLoading } = useQuery({
@@ -1279,7 +1294,9 @@ function SeatsTab({ licenseId, maxSeats }: { licenseId: string; maxSeats: number
   })
 
   const { items: seats, total, totalPages } = pg.from(data, data?.seats)
-  const activeCount = data?.active_count ?? 0
+  // active_count is the members; on a product with seats max_seats
+  // counts the owner too, who holds one without a row.
+  const activeCount = (data?.active_count ?? 0) + (hasSeats ? 1 : 0)
 
   if (isLoading) return <div className="h-32 animate-pulse bg-muted rounded-lg" />
 
@@ -1289,8 +1306,9 @@ function SeatsTab({ licenseId, maxSeats }: { licenseId: string; maxSeats: number
         {t("licenses.seats")} ({activeCount}
         {maxSeats > 0 ? ` / ${maxSeats}` : ""} {t("licenses.active")})
       </h3>
+      {hasSeats && <p className="text-xs text-muted-foreground">{t("licenses.seatsIncludeOwner")}</p>}
       {seats.length === 0 ? (
-        <p className="text-sm text-muted-foreground">{t("licenses.noSeats")}</p>
+        <p className="text-sm text-muted-foreground">{t(hasSeats ? "licenses.noMembers" : "licenses.noSeats")}</p>
       ) : (
         <DataTable>
           <DataTableHeader>
@@ -1307,7 +1325,12 @@ function SeatsTab({ licenseId, maxSeats }: { licenseId: string; maxSeats: number
               <DataTableRow key={s.id}>
                 <DataTableCell className="font-medium">{s.email}</DataTableCell>
                 <DataTableCell>
-                  <Badge variant="secondary">{s.role}</Badge>
+                  {/* A seat at the owner's own address (the license email
+                    changed to a member's) is the owner, not counted as a
+                    member in active_count. */}
+                  <Badge variant="secondary">
+                    {s.email.toLowerCase() === ownerEmail.toLowerCase() ? t("portal.roleOwner") : s.role}
+                  </Badge>
                 </DataTableCell>
                 <DataTableCell>
                   {s.removed_at ? (

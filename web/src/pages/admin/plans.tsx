@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Copy, Package, Pencil, Plus, Trash2 } from "lucide-react"
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Link } from "react-router-dom"
 import { CopyableId } from "@/components/copyable-id"
 import { ProductSelect } from "@/components/product-select"
@@ -65,6 +65,24 @@ export default function PlansPage() {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Plan | null>(null)
   const [deleting, setDeleting] = useState<Plan | null>(null)
+  // An edit that lowers max_seats below what some licenses already hold,
+  // waiting for the admin to confirm it.
+  // The content stays set after closing, so the dialog's closing
+  // animation does not show it emptied; only the open flag clears.
+  const [seatWarning, setSeatWarning] = useState<{ update: Partial<Plan> & { id: string }; over: number } | null>(null)
+  const [seatWarningOpen, setSeatWarningOpen] = useState(false)
+  // While the impact is being fetched the save button stays busy. Each
+  // check takes a number, and opening or closing the editor moves it on:
+  // an answer for an older number (an editor since closed, even one
+  // reopened on the same plan) is dropped, success or error, and does
+  // not clear the busy state of a newer check.
+  const [checkingSeats, setCheckingSeats] = useState(false)
+  const checkSeq = useRef(0)
+  const openEditor = (plan: Plan | null) => {
+    checkSeq.current++
+    setCheckingSeats(false)
+    setEditing(plan)
+  }
 
   const products = productsData?.products || []
   const { items: plans, total, totalPages } = pg.from(data, data?.plans)
@@ -82,10 +100,37 @@ export default function PlansPage() {
     mutationFn: ({ id, ...data }: Partial<Plan> & { id: string }) => admin.updatePlan(id, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "plans"] })
-      setEditing(null)
+      openEditor(null)
     },
     onError: (e: Error) => showToast(e.message, "error"),
   })
+  // A plan's limits apply to every license on it at once. Lowering
+  // max_seats leaves the licenses already above it with their members
+  // but no room to invite, so the admin sees how many first.
+  const saveEdit = async (plan: Plan, update: Partial<Plan> & { id: string }) => {
+    const next = update.max_seats ?? plan.max_seats
+    const prev = plan.max_seats
+    if (next > 0 && (prev === 0 || next < prev)) {
+      if (checkingSeats) return
+      const seq = ++checkSeq.current
+      setCheckingSeats(true)
+      try {
+        const { licenses_over } = await admin.planSeatImpact(plan.id, next)
+        if (checkSeq.current !== seq) return
+        if (licenses_over > 0) {
+          setSeatWarning({ update, over: licenses_over })
+          setSeatWarningOpen(true)
+          return
+        }
+      } catch (e) {
+        if (checkSeq.current === seq) showToast((e as Error).message, "error")
+        return
+      } finally {
+        if (checkSeq.current === seq) setCheckingSeats(false)
+      }
+    }
+    updateMut.mutate(update)
+  }
   const deleteMut = useMutation({
     mutationFn: (id: string) => admin.deletePlan(id),
     onSuccess: () => {
@@ -227,7 +272,7 @@ export default function PlansPage() {
                                 <Copy className="h-4 w-4" />
                               </Button>
                             )}
-                            <Button variant="ghost" size="icon" onClick={() => setEditing(p)}>
+                            <Button variant="ghost" size="icon" onClick={() => openEditor(p)}>
                               <Pencil className="h-4 w-4" />
                             </Button>
                             <Button variant="ghost" size="icon" onClick={() => setDeleting(p)}>
@@ -273,14 +318,39 @@ export default function PlansPage() {
       {editing && (
         <PlanDialog
           open
-          onClose={() => setEditing(null)}
+          onClose={() => openEditor(null)}
           plan={editing}
           products={products}
-          onSubmit={(d) => updateMut.mutate({ id: editing.id, ...d })}
-          loading={updateMut.isPending}
+          onSubmit={(d) => saveEdit(editing, { id: editing.id, ...d })}
+          loading={updateMut.isPending || checkingSeats}
           title={t("plans.editTitle")}
         />
       )}
+
+      {/* Lowering max seats below what some licenses hold */}
+      <AlertDialog open={seatWarningOpen} onOpenChange={setSeatWarningOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("plans.seatsLowerTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("plans.seatsLowerConfirm")
+                .replace("{count}", String(seatWarning?.over ?? 0))
+                .replace("{max}", String(seatWarning?.update.max_seats ?? 0))}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="flex justify-end gap-2">
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (seatWarning) updateMut.mutate(seatWarning.update)
+                setSeatWarningOpen(false)
+              }}
+            >
+              {t("common.save")}
+            </AlertDialogAction>
+          </div>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Delete */}
       <AlertDialog open={!!deleting} onOpenChange={() => setDeleting(null)}>
@@ -518,7 +588,7 @@ function PlanDialog({
                   <Input
                     type="number"
                     min={0}
-                    max={100000}
+                    max={100001}
                     value={form.max_seats}
                     onChange={(e) => set("max_seats", Number(e.target.value))}
                   />

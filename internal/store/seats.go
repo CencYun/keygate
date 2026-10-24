@@ -78,8 +78,11 @@ const (
 // trying to insert a brand-new row that would collide on the
 // partial-unique index.
 //
-// maxSeats <= 0 means "no limit" (uniform with the rest of the code
-// that reads `lic.Plan.MaxSeats > 0` as the cap-active sentinel).
+// maxSeats is the plan's max_seats: how many people the license holds,
+// the owner included. The owner has no seat row (self-invites are
+// refused), so the rows may number one less. maxSeats <= 0 means "no
+// limit" (uniform with the rest of the code that reads
+// `lic.Plan.MaxSeats > 0` as the cap-active sentinel).
 func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSeats int) (SeatAddOutcome, error) {
 	if seat.ID == "" {
 		seat.ID = newID()
@@ -137,16 +140,14 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 		return "", err
 	}
 
-	// Capacity check — only count rows that aren't soft-deleted.
+	// Capacity check — the members (see memberSeatsSQL), plus one for
+	// the owner, who holds a seat without a row.
 	if maxSeats > 0 {
 		var count int
-		if err := tx.NewRaw(
-			"SELECT COUNT(*) FROM seats WHERE license_id = ? AND removed_at IS NULL",
-			seat.LicenseID,
-		).Scan(ctx, &count); err != nil {
+		if err := tx.NewRaw(memberSeatsSQL, seat.LicenseID).Scan(ctx, &count); err != nil {
 			return "", err
 		}
-		if count >= maxSeats {
+		if count+1 >= maxSeats {
 			return "", ErrSeatLimitReached
 		}
 	}
@@ -354,9 +355,37 @@ func (s *Store) ListSeats(ctx context.Context, licenseID string, p Page) ([]*mod
 	return out, total, nil
 }
 
+// memberSeatsSQL counts a license's members: its seats that are not
+// removed, leaving out one held by the owner's own address. Self-invites
+// are refused, but the license email can change afterwards (a Stripe
+// customer's new address) to that of an existing member, who would
+// otherwise count twice, once as the owner and once as a member.
+const memberSeatsSQL = `SELECT COUNT(*) FROM seats s JOIN licenses l ON l.id = s.license_id
+	WHERE s.license_id = ? AND s.removed_at IS NULL AND lower(s.email) <> lower(l.email)`
+
+// CountLicensesOverSeatLimit returns how many licenses on the plan hold
+// more people, the owner included, than maxSeats would allow: what
+// lowering the plan's max_seats to it would leave over the limit. Their
+// members stay; they only cannot invite more. 0 when maxSeats <= 0 (no
+// limit).
+func (s *Store) CountLicensesOverSeatLimit(ctx context.Context, planID string, maxSeats int) (int, error) {
+	if maxSeats <= 0 {
+		return 0, nil
+	}
+	var n int
+	err := s.DB.NewRaw(`SELECT COUNT(*) FROM licenses l WHERE l.plan_id = ? AND 1 + (
+		SELECT COUNT(*) FROM seats s
+		WHERE s.license_id = l.id AND s.removed_at IS NULL AND lower(s.email) <> lower(l.email)) > ?`,
+		planID, maxSeats).Scan(ctx, &n)
+	return n, err
+}
+
+// CountActiveSeats returns how many members a license has, the owner
+// not included (see memberSeatsSQL).
 func (s *Store) CountActiveSeats(ctx context.Context, licenseID string) (int, error) {
-	return s.DB.NewSelect().Model((*model.Seat)(nil)).
-		Where("license_id = ? AND removed_at IS NULL", licenseID).Count(ctx)
+	var n int
+	err := s.DB.NewRaw(memberSeatsSQL, licenseID).Scan(ctx, &n)
+	return n, err
 }
 
 func (s *Store) RemoveSeat(ctx context.Context, id string) error {

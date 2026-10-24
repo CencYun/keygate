@@ -97,12 +97,15 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
   const [showCancel, setShowCancel] = useState(false)
   const productType = lic.product?.type || "perpetual"
   const showUsage = productType === "saas" || productType === "hybrid"
-  // Seats UI shows for any plan that *could* have more than one seat.
-  // Backend treats max_seats=0 as "no limit", so the only case we hide
-  // is max_seats=1 (true single-seat). Perpetual products don't have
-  // a portal-managed team, so gate on product type too.
+  // Seats UI shows for any plan that *could* have more than one person.
+  // max_seats counts the owner and 0 means "no limit", so max_seats=1
+  // is a single-seat license, hidden unless it somehow has members
+  // already (the owner must still be able to see and remove them).
+  // Perpetual products don't have a portal-managed team, so gate on
+  // product type too.
   const seatCap = lic.plan?.max_seats ?? 0
-  const showSeats = (productType === "saas" || productType === "hybrid") && seatCap !== 1
+  const hasMembers = (lic.seats ?? []).some((s) => !s.removed_at && s.email.toLowerCase() !== lic.email?.toLowerCase())
+  const showSeats = (productType === "saas" || productType === "hybrid") && (seatCap !== 1 || hasMembers)
 
   const copyKey = () => {
     navigator.clipboard.writeText(lic.license_key)
@@ -157,6 +160,10 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
   }
 
   const defaultTab = "overview"
+  const [tab, setTab] = useState(defaultTab)
+  // The team tab goes away when the last member of a single seat
+  // license is removed; the panel must not stay selected and blank.
+  const activeTab = tab === "seats" && !showSeats ? defaultTab : tab
 
   return (
     <Card>
@@ -261,7 +268,7 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
         <Separator />
 
         {/* Tabs for detailed sections */}
-        <Tabs defaultValue={defaultTab}>
+        <Tabs value={activeTab} onValueChange={setTab}>
           <TabsList>
             <TabsTrigger value="overview">{t("licenses.activations")}</TabsTrigger>
             <TabsTrigger value="entitlements">{t("plans.entitlements")}</TabsTrigger>
@@ -512,6 +519,9 @@ function SeatsSection({ license }: { license: PortalLicense }) {
     mutationFn: (seatId: string) => portal.removeSeat({ license_key: license.license_key, seat_id: seatId }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["portal", "seats", license.id] })
+      // The license list carries the seats that decide whether the team
+      // tab shows at all.
+      qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
       setRemoving(null)
     },
     // Errors surface via the global MutationCache toast handler in
@@ -523,9 +533,14 @@ function SeatsSection({ license }: { license: PortalLicense }) {
   })
 
   const seats = seatsQuery.data?.seats || []
-  const activeCount = seats.filter((s) => !s.removed_at).length
-  // maxSeats=0 means "no limit" per backend (internal/store/seats.go:81);
-  // never gate the Add button in that case.
+  // A seat at the owner's own address (left behind when the license
+  // email changed to a member's) is the owner, shown once, at the top.
+  const ownerEmail = license.email?.toLowerCase() ?? ""
+  const members = seats.filter((s) => s.email.toLowerCase() !== ownerEmail)
+  // People on the license: the members plus the owner, who holds a seat
+  // without a row, as max_seats counts them on the server.
+  const activeCount = members.filter((s) => !s.removed_at).length + 1
+  // maxSeats=0 means "no limit"; never gate the Add button in that case.
   const maxSeats = license.plan?.max_seats ?? 0
   const atLimit = maxSeats > 0 && activeCount >= maxSeats
 
@@ -557,11 +572,18 @@ function SeatsSection({ license }: { license: PortalLicense }) {
 
       {seatsQuery.isLoading ? (
         <div className="h-16 animate-pulse bg-muted rounded-lg" />
-      ) : seats.length === 0 ? (
-        <p className="text-sm text-muted-foreground py-4 text-center">{t("portal.noMembers")}</p>
       ) : (
         <div className="space-y-2">
-          {seats.map((s) => (
+          <div className="flex items-center gap-2 bg-muted/50 rounded px-3 py-2 text-sm">
+            <span className="font-medium truncate">{license.email}</span>
+            <Badge variant="secondary" className="text-xs">
+              {t("portal.roleOwner")}
+            </Badge>
+          </div>
+          {members.length === 0 && (
+            <p className="text-sm text-muted-foreground py-2 text-center">{t("portal.noMembers")}</p>
+          )}
+          {members.map((s) => (
             <SeatRow
               key={s.id}
               seat={s}
@@ -621,12 +643,14 @@ function SeatRow({
           </Badge>
           {!accepted && (
             <Badge variant="outline" className="text-xs">
-              {t("licenses.invited")}
+              {t("portal.seatPending")}
             </Badge>
           )}
         </div>
         <p className="text-xs text-muted-foreground mt-0.5">
-          {accepted ? `${t("portal.lastVerified")} ${formatDate(seat.accepted_at!)}` : formatDate(seat.invited_at)}
+          {accepted
+            ? `${t("portal.seatJoinedOn")} ${formatDate(seat.accepted_at!)}`
+            : `${t("portal.seatInvitedOn")} ${formatDate(seat.invited_at)}`}
         </p>
       </div>
       {canManage && (
@@ -656,6 +680,7 @@ function InviteSeatDialog({ license, onClose }: { license: PortalLicense; onClos
     onSuccess: () => {
       showToast(t("licenses.seatInviteSent"))
       qc.invalidateQueries({ queryKey: ["portal", "seats", license.id] })
+      qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
       onClose()
     },
     onError: (e: Error) => showToast(e.message, "error"),

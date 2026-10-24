@@ -111,10 +111,12 @@ func (s *SeatService) AddSeat(ctx context.Context, in AddSeatInput) (*model.Seat
 	outcome, err := s.store.AddSeatWithinLimit(ctx, seat, maxSeats)
 	if err != nil {
 		if errors.Is(err, store.ErrSeatLimitReached) {
-			current, _ := s.store.CountActiveSeats(ctx, lic.ID)
+			// People on the license, the owner included, as max_seats
+			// counts them.
+			members, _ := s.store.CountActiveSeats(ctx, lic.ID)
 			return nil, apperr.WithDetails(
 				apperr.Conflict("SEAT_LIMIT", "maximum seats reached"),
-				map[string]any{"max": maxSeats, "current": current},
+				map[string]any{"max": maxSeats, "current": members + 1},
 			)
 		}
 		return nil, apperr.Internal(err)
@@ -269,19 +271,4 @@ func (s *SeatService) ListSeats(ctx context.Context, licenseKey, productID strin
 		return nil, apperr.Internal(err)
 	}
 	return seats, nil
-}
-
-func (s *SeatService) CheckSeatAccess(ctx context.Context, licenseKey, email, productID string) (bool, error) {
-	lic, err := s.store.FindLicenseByKey(ctx, licenseKey)
-	if err != nil {
-		return false, nil
-	}
-	if productID != "" && lic.ProductID != productID {
-		return false, nil
-	}
-	if lic.Plan == nil || lic.Plan.MaxSeats == 0 {
-		return true, nil
-	}
-	_, err = s.store.FindSeatByEmail(ctx, lic.ID, email)
-	return err == nil, nil
 }
