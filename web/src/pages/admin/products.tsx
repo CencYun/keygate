@@ -123,6 +123,7 @@ export default function ProductsPage() {
                   <DataTableRow>
                     <DataTableHead>{t("common.name")}</DataTableHead>
                     <DataTableHead>{t("products.slug")}</DataTableHead>
+                    <DataTableHead>{t("products.licensePrefix")}</DataTableHead>
                     <DataTableHead>{t("common.type")}</DataTableHead>
                     <DataTableHead>{t("common.created")}</DataTableHead>
                     <DataTableHead className="w-32 text-right">{t("common.actions")}</DataTableHead>
@@ -135,6 +136,9 @@ export default function ProductsPage() {
                       <DataTableCell className="font-medium">{p.name}</DataTableCell>
                       <DataTableCell>
                         <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{p.slug}</code>
+                      </DataTableCell>
+                      <DataTableCell>
+                        <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{p.license_prefix}</code>
                       </DataTableCell>
                       <DataTableCell>
                         <Badge variant="secondary">{p.type}</Badge>
@@ -267,6 +271,7 @@ function ProductDialog({
   onSubmit: (data: {
     name: string
     slug: string
+    license_prefix: string
     type: string
     feed_license_required?: boolean
     download_url?: string
@@ -277,6 +282,7 @@ function ProductDialog({
   const { t } = useI18n()
   const [name, setName] = useState(product?.name || "")
   const [slug, setSlug] = useState(product?.slug || "")
+  const [licensePrefix, setLicensePrefix] = useState(product?.license_prefix || "KG")
   const [type, setType] = useState(product?.type || "desktop")
   const [downloadURL, setDownloadURL] = useState(product?.download_url ?? "")
 
@@ -298,6 +304,7 @@ function ProductDialog({
     onSubmit({
       name,
       slug,
+      license_prefix: licensePrefix,
       type,
       download_url: downloadURL.trim(),
       ...(needsGate && { feed_license_required: true }),
@@ -334,6 +341,26 @@ function ProductDialog({
             <div className="space-y-2">
               <Label>{t("products.slug")}</Label>
               <Input value={slug} onChange={(e) => setSlug(e.target.value)} required />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="product-license-prefix">{t("products.licensePrefix")}</Label>
+              <Input
+                id="product-license-prefix"
+                className="font-mono"
+                value={licensePrefix}
+                onChange={(e) => setLicensePrefix(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
+                minLength={2}
+                maxLength={8}
+                pattern="[A-Z0-9]{2,8}"
+                required
+              />
+              <p className="text-xs text-muted-foreground">
+                {t("products.licensePrefixHint")}{" "}
+                <code className="break-all">{`${licensePrefix || "KG"}-XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX`}</code>
+              </p>
+              {product && licensePrefix !== product.license_prefix && (
+                <p className="text-xs text-muted-foreground">{t("products.licensePrefixChange")}</p>
+              )}
             </div>
             <div className="space-y-2">
               <Label>{t("common.type")}</Label>
