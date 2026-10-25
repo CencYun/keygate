@@ -46,7 +46,7 @@ func setQuantity(t *testing.T, s *store.Store, ctx context.Context, licenseID st
 }
 
 func invite(s *store.Store, ctx context.Context, lic *model.License, n, max int) error {
-	_, err := s.AddSeatWithinLimit(ctx, &model.Seat{LicenseID: lic.ID, Email: fmt.Sprintf("m%d-%s", n, lic.Email), Role: "member"}, max)
+	_, _, err := s.AddSeatWithinLimit(ctx, &model.Seat{LicenseID: lic.ID, Email: fmt.Sprintf("m%d-%s", n, lic.Email), Role: "member"}, max)
 	return err
 }
 

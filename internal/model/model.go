@@ -114,6 +114,18 @@ func ProductSupports(t, capability string) bool {
 	return false
 }
 
+// ProductTypesSupporting lists the product types that have capability
+// (see ProductSupports), for checks made in SQL.
+func ProductTypesSupporting(capability string) []string {
+	var out []string
+	for _, t := range []string{ProductTypeDesktop, ProductTypeSaaS, ProductTypeHybrid} {
+		if ProductSupports(t, capability) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 type Product struct {
 	bun.BaseModel `bun:"table:products"`
 
@@ -465,6 +477,11 @@ type License struct {
 	// working it out from the plan. Absent when the plan is not loaded.
 	SeatLimit       *int `bun:"-" json:"seat_limit,omitempty"`
 	ActivationLimit *int `bun:"-" json:"activation_limit,omitempty"`
+
+	// KeySeat is the member whose own key found this licence (see
+	// Store.FindLicenseByKey); nil when it was found by the licence's
+	// key or any other way.
+	KeySeat *Seat `bun:"-" json:"-"`
 }
 
 // Limits are the people and devices this licence holds (see
@@ -522,6 +539,17 @@ type Activation struct {
 	IPAddress      string    `json:"ip_address,omitempty"`
 	LastVerified   time.Time `bun:",nullzero,default:now()" json:"last_verified"`
 	CreatedAt      time.Time `bun:",nullzero,default:now()" json:"created_at"`
+	// SeatID is the member whose key activated the device; empty for
+	// the owner's key. Removing the member removes the device.
+	SeatID string `bun:",nullzero" json:"seat_id,omitempty"`
+	// PredatesMemberKeys marks a device activated with the licence's
+	// key before members had keys of their own, when members used that
+	// key: it may move, once, to the member whose key activates it (see
+	// Store.ActivateForKey).
+	PredatesMemberKeys bool `bun:",notnull" json:"-"`
+	// MemberEmail is that member's address, filled in where devices are
+	// shown (see Store.FillMemberEmails).
+	MemberEmail string `bun:"-" json:"member_email,omitempty"`
 
 	License *License `bun:"rel:belongs-to,join:license_id=id" json:"license,omitempty"`
 }
@@ -557,11 +585,31 @@ type Seat struct {
 	// invitee. Cleared on accept / expire / revoke so the slot
 	// frees up. The plain token never lives in the DB.
 	InviteTokenHash string `bun:",nullzero" json:"-"`
-	// InviteExpiresAt: pinned at invite-time. After this, /seats/accept
-	// returns 410 GONE and admin must re-issue.
+	// InviteExpiresAt: pinned at invite-time. After this, accepting
+	// answers 404 SEAT_INVITE_INVALID and the owner must re-invite.
 	InviteExpiresAt *time.Time `json:"invite_expires_at,omitempty"`
-	CreatedAt       time.Time  `bun:",nullzero,default:now()" json:"created_at"`
-	License         *License   `bun:"rel:belongs-to,join:license_id=id" json:"license,omitempty"`
+	// MemberKey is the member's own license key, made the first time
+	// they open the portal after accepting (see Store.MemberKey) and
+	// cleared when they are removed. It is kept and found the way a
+	// license key is: never in JSON, read through Store.MemberKey.
+	MemberKey          string    `bun:",nullzero" json:"-"`
+	MemberKeyHash      string    `bun:",nullzero" json:"-"`
+	MemberKeyEncrypted []byte    `bun:",nullzero" json:"-"`
+	CreatedAt          time.Time `bun:",nullzero,default:now()" json:"created_at"`
+	License            *License  `bun:"rel:belongs-to,join:license_id=id" json:"license,omitempty"`
+}
+
+// JoinedSeats is the members who have accepted and are still on the
+// team: the team as a member sees it. Pending invitations, and the
+// addresses they were sent to, are the owner's to see.
+func JoinedSeats(seats []*Seat) []*Seat {
+	out := make([]*Seat, 0, len(seats))
+	for _, s := range seats {
+		if s.AcceptedAt != nil && s.RemovedAt == nil {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // ─── Usage ───
@@ -666,6 +714,9 @@ type FloatingSession struct {
 	CheckedOut    time.Time `bun:",nullzero,default:now()" json:"checked_out"`
 	ExpiresAt     time.Time `bun:",notnull" json:"expires_at"`
 	Heartbeat     time.Time `bun:",nullzero,default:now()" json:"heartbeat"`
+	// SeatID is the member whose key checked the session out; empty for
+	// the license's key. Removing the member ends it.
+	SeatID string `bun:",nullzero" json:"seat_id,omitempty"`
 }
 
 // ─── Addon ───

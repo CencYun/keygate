@@ -1310,7 +1310,7 @@ func TestSeats_TwoRaisesOneAtATime(t *testing.T) {
 	}
 	f.fake.delay = 0
 	for i := 0; i < 7; i++ { // 8 people with the owner
-		if _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("r%d-%s", i, f.lic.Email), Role: "member"}, 8); err != nil {
+		if _, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("r%d-%s", i, f.lic.Email), Role: "member"}, 8); err != nil {
 			t.Fatalf("person %d on 8 seats: %v", i, err)
 		}
 	}
@@ -1335,7 +1335,7 @@ func TestSeats_ChangeCheckedAgainstLimitsMovedSince(t *testing.T) {
 		f.fake.set(f.team.StripePriceID, 8)
 		f.subscriptionUpdated()
 		for i := 0; i < 7; i++ {
-			if _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("m%d-%s", i, f.lic.Email), Role: "member"}, 8); err != nil {
+			if _, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("m%d-%s", i, f.lic.Email), Role: "member"}, 8); err != nil {
 				t.Errorf("person %d: %v", i, err)
 			}
 		}
@@ -1402,7 +1402,7 @@ func TestSeats_BusyAfterAnAttemptThatWasMade(t *testing.T) {
 		t.Fatalf("quantity = %d, want the 2 Stripe bills", q)
 	}
 	for i := 0; i < 2; i++ {
-		_, _ = f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("p%d-%s", i, f.lic.Email), Role: "member"}, 5)
+		_, _, _ = f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("p%d-%s", i, f.lic.Email), Role: "member"}, 5)
 	}
 	if n, _ := f.s.CountActiveSeats(f.ctx, f.lic.ID); n+1 > 2 {
 		t.Fatalf("%d people on a licence Stripe bills 2 seats for", n+1)
@@ -1546,7 +1546,7 @@ func TestSeats_DowngradeHoldsInvitesBack(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	got := 0
 	for i := 0; i < 4; i++ {
-		if _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("w%d-%s", i, f.lic.Email), Role: "member"}, 6); err == nil {
+		if _, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("w%d-%s", i, f.lic.Email), Role: "member"}, 6); err == nil {
 			got++
 		}
 	}
@@ -1695,7 +1695,7 @@ func TestSeats_DowngradeCountsAgainUnderTheLock(t *testing.T) {
 		// The last look at the price before the licence is lowered.
 		if r.URL.Path == "/v1/invoices/create_preview" && atomic.AddInt32(&joined, 1) == 1 {
 			for i := range 2 {
-				if _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("late%d-%s", i, f.lic.Email), Role: "member"}, 5); err != nil {
+				if _, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("late%d-%s", i, f.lic.Email), Role: "member"}, 5); err != nil {
 					t.Errorf("join: %v", err)
 				}
 			}
@@ -1737,7 +1737,7 @@ func TestSeats_ReadDuringADowngradeKeepsTheLowerSeats(t *testing.T) {
 			}
 			got := 0
 			for i := range 4 {
-				if _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("r%d-%s", i, f.lic.Email), Role: "member"}, 6); err == nil {
+				if _, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("r%d-%s", i, f.lic.Email), Role: "member"}, 6); err == nil {
 					got++
 				}
 			}
@@ -2097,7 +2097,7 @@ func TestSeats_LateReadAfterADowngradeIsOutOfDate(t *testing.T) {
 	f.post(f.h.PendingSubscriptionChange, f.lic.Email, fmt.Sprintf(`{"license_id":%q}`, f.lic.ID))
 	got := 0
 	for i := range 4 {
-		if _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("x%d-%s", i, f.lic.Email), Role: "member"}, 6); err == nil {
+		if _, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("x%d-%s", i, f.lic.Email), Role: "member"}, 6); err == nil {
 			got++
 		}
 	}
@@ -2191,7 +2191,7 @@ func TestSeats_UnknownDowngradeHoldOutlivesTheRequest(t *testing.T) {
 	}
 	got := 0
 	for i := range 4 {
-		if _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("h%d-%s", i, f.lic.Email), Role: "member"}, 6); err == nil {
+		if _, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("h%d-%s", i, f.lic.Email), Role: "member"}, 6); err == nil {
 			got++
 		}
 	}
@@ -2548,7 +2548,7 @@ func TestUpgrade_NoInvitesWhileTheCheckoutIsOpen(t *testing.T) {
 	}
 	invite := func(email string) error {
 		_, hash := store.GenerateSeatInviteToken()
-		_, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: email + "-" + f.lic.Email, Role: "member", InviteTokenHash: hash}, 10)
+		_, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: email + "-" + f.lic.Email, Role: "member", InviteTokenHash: hash}, 10)
 		return err
 	}
 	if err := invite("before"); err != nil {
@@ -2595,7 +2595,7 @@ func TestUpgrade_PerSeatOverItsSeatsAppliesAsPaid(t *testing.T) {
 	if n, _ := f.s.CountActiveSeats(f.ctx, f.lic.ID); n != 2 {
 		t.Fatalf("members = %d, want both kept", n)
 	}
-	if _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: "new-" + f.lic.Email, Role: "member"}, 1); !errors.Is(err, store.ErrSeatLimitReached) {
+	if _, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: "new-" + f.lic.Email, Role: "member"}, 1); !errors.Is(err, store.ErrSeatLimitReached) {
 		t.Fatalf("invite over the seats bought = %v, want ErrSeatLimitReached", err)
 	}
 }
@@ -2676,7 +2676,7 @@ func TestUpgrade_InviteWaitsForTheCheckoutBeingOpened(t *testing.T) {
 	invited := make(chan error, 1)
 	go func() {
 		_, hash := store.GenerateSeatInviteToken()
-		_, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: "late-" + f.lic.Email, Role: "member", InviteTokenHash: hash}, 10)
+		_, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: "late-" + f.lic.Email, Role: "member", InviteTokenHash: hash}, 10)
 		invited <- err
 	}()
 	select {

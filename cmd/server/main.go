@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -434,6 +432,7 @@ func main() {
 	// are gone.
 	db.SetFeedURLTTL(feedTTL)
 	adminH.FeedURLTTL = feedTTL
+	adminH.Seats = seatSvc
 	// Whether a Stripe subscription is over is Stripe's answer to
 	// give; the admin API asks through this rather than reaching for
 	// the SDK itself. Left nil without an API key, where the question
@@ -902,7 +901,8 @@ func main() {
 			// payloads by accident. Here it is the customer's own
 			// credential and the portal genuinely needs it — it is
 			// both displayed and used to address the activation and
-			// seat endpoints — so re-attach it explicitly.
+			// seat endpoints — so re-attach it explicitly: the
+			// owner's key for the owner, a member's own for them.
 			type portalLicense struct {
 				*model.License
 				LicenseKey string `json:"license_key"`
@@ -918,7 +918,15 @@ func main() {
 			}
 			out := make([]portalLicense, 0, len(licenses))
 			for _, l := range licenses {
-				out = append(out, portalLicense{License: l, LicenseKey: db.DecryptLicenseKey(l), Upgradable: upgradable[l.ID]})
+				key, ok, err := handler.PortalLicenseView(c, db, l, emailStr)
+				if err != nil {
+					response.Internal(c, err)
+					return
+				}
+				if !ok {
+					continue
+				}
+				out = append(out, portalLicense{License: l, LicenseKey: key, Upgradable: upgradable[l.ID]})
 			}
 			// The portal hides the renewal button while the switch is
 			// off; the endpoint refuses the sale regardless.
@@ -1003,132 +1011,10 @@ func main() {
 			}
 			response.OK(c, gin.H{"plans": response.Array(active)})
 		})
-		// Both portal guards parse the request body to extract
-		// license_key. Without an explicit cap a logged-in user could
-		// stream gigabytes through the body buffer; session auth is a
-		// weak defense against compromised credentials sending
-		// memory-exhaustion payloads. 64 KiB is comfortably above any
-		// real portal request (license_key + a handful of fields).
-		const portalGuardMaxBody = 64 * 1024
-
-		// readGuardBody is shared by both guards: cap the body, read
-		// it, restore an in-memory reader for the downstream handler
-		// (so c.ShouldBindJSON still sees the same bytes).
-		readGuardBody := func(c *gin.Context) ([]byte, bool) {
-			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, portalGuardMaxBody)
-			body, err := io.ReadAll(c.Request.Body)
-			if err != nil {
-				response.Err(c, http.StatusRequestEntityTooLarge, "BODY_TOO_LARGE",
-					"request body exceeds 64 KiB")
-				c.Abort()
-				return nil, false
-			}
-			c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
-			return body, true
-		}
-
-		// Portal license operations — verify the license belongs to the logged-in user
-		portalLicenseGuard := func(c *gin.Context) {
-			body, ok := readGuardBody(c)
-			if !ok {
-				return
-			}
-			var req struct {
-				LicenseKey string `json:"license_key"`
-			}
-			if json.Unmarshal(body, &req) != nil || req.LicenseKey == "" {
-				c.Next()
-				return
-			}
-			email, _ := c.Get("email")
-			emailStr, _ := email.(string)
-			if emailStr == "" {
-				response.Unauthorized(c, "unauthorized")
-				c.Abort()
-				return
-			}
-			// Check license belongs to user (by email or seat). Use
-			// EqualFold so mixed-case email rows don't lock the owner
-			// out of their own license — emails are case-insensitive
-			// per RFC 5321 in practice, and admin-created licenses
-			// may have stored mixed case.
-			lic, err := db.FindLicenseByKey(c, req.LicenseKey)
-			if err != nil {
-				c.Next() // let handler return proper 404
-				return
-			}
-			if !strings.EqualFold(lic.Email, emailStr) {
-				// Check if user has a seat on this license. Return
-				// the same 404, code included, the handler returns
-				// when the license doesn't exist — otherwise the differential between
-				// 403 (exists but yours) and 404 (doesn't exist) is
-				// a license-existence oracle. License keys are 32-
-				// byte random so the keyspace defeats enumeration in
-				// practice, but the oracle is gratuitous.
-				if _, err := db.FindSeatByEmail(c, lic.ID, emailStr); err != nil {
-					response.Err(c, http.StatusNotFound, "LICENSE_NOT_FOUND", "license not found")
-					c.Abort()
-					return
-				}
-			}
-			c.Next()
-		}
-		// Seat mutation guard — only license owner or accepted admin seat can add/remove seats
-		portalSeatMutationGuard := func(c *gin.Context) {
-			body, ok := readGuardBody(c)
-			if !ok {
-				return
-			}
-			var req struct {
-				LicenseKey string `json:"license_key"`
-			}
-			if json.Unmarshal(body, &req) != nil || req.LicenseKey == "" {
-				c.Next()
-				return
-			}
-			email, _ := c.Get("email")
-			emailStr, _ := email.(string)
-			// Defense in depth: a malformed JWT that produced an empty
-			// email claim must not fall through to seat lookups with
-			// "" — that would only match seats whose email column is
-			// literally empty (forbidden by schema, but belt-and-
-			// suspenders).
-			if emailStr == "" {
-				response.Unauthorized(c, "unauthorized")
-				c.Abort()
-				return
-			}
-			lic, err := db.FindLicenseByKey(c, req.LicenseKey)
-			if err != nil {
-				c.Next()
-				return
-			}
-			// License owner can always manage seats. EqualFold for the
-			// same case-folding reason as portalLicenseGuard.
-			if strings.EqualFold(lic.Email, emailStr) {
-				c.Next()
-				return
-			}
-			// Seat-based access: only ACCEPTED admin can mutate. Seat
-			// roles are 2-tier (admin / member) — the license owner is
-			// implicit via license.email and was already matched above.
-			// A still-pending admin invite confers no authority until
-			// the invitee has explicitly claimed the seat — otherwise
-			// possession of an unclaimed admin token would let an
-			// OTP-logged-in user act as admin on the license without
-			// going through the accept flow.
-			//
-			// Same shape as the 404 the handler returns when the
-			// license doesn't exist, so this middleware doesn't act
-			// as a "this license exists but isn't yours" oracle.
-			seat, err := db.FindSeatByEmail(c, lic.ID, emailStr)
-			if err != nil || seat.AcceptedAt == nil || seat.Role != "admin" {
-				response.Err(c, http.StatusNotFound, "LICENSE_NOT_FOUND", "license not found")
-				c.Abort()
-				return
-			}
-			c.Next()
-		}
+		// The portal guards: licence operations for the owner and its
+		// accepted members, team changes for the owner alone.
+		portalLicenseGuard := handler.PortalLicenseGuard(db)
+		portalSeatMutationGuard := handler.PortalSeatOwnerGuard(db)
 		portal.POST("/usage", portalLicenseGuard, usageH.RecordUsage)
 		portal.POST("/usage/status", portalLicenseGuard, usageH.GetQuotaStatus)
 		portal.POST("/seats", portalLicenseGuard, seatH.ListSeats)
@@ -1221,6 +1107,7 @@ func main() {
 		licWrite.GET("/licenses/export", adminH.ExportLicenses)
 		licWrite.GET("/licenses/:id", adminH.GetLicense)
 		licWrite.GET("/licenses/:id/key", adminH.RevealLicenseKey)
+		licWrite.POST("/licenses/:id/rotate-key", adminH.RotateLicenseKey)
 		// Mails the key to the address on the licence, for a send
 		// that never arrived. Recipient is not caller-supplied.
 		licWrite.POST("/licenses/:id/resend-email", adminH.ResendLicenseEmail)
@@ -1239,6 +1126,9 @@ func main() {
 		licWrite.GET("/licenses/:id/usage", adminH.ListLicenseUsage)
 		licWrite.POST("/licenses/:id/usage/reset", adminH.ResetLicenseUsage)
 		licWrite.GET("/licenses/:id/seats", adminH.ListLicenseSeats)
+		licWrite.GET("/licenses/:id/seats/:seat_id/key", adminH.RevealMemberKey)
+		licWrite.POST("/licenses/:id/seats/:seat_id/rotate-key", adminH.RotateMemberKey)
+		licWrite.DELETE("/licenses/:id/seats/:seat_id", adminH.RemoveLicenseSeat)
 
 		licWrite.GET("/licenses/:id/addons", adminH.ListLicenseAddons)
 		licWrite.POST("/licenses/:id/addons", adminH.AddLicenseAddon)

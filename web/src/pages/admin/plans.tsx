@@ -282,7 +282,7 @@ export default function PlansPage() {
                                 onClick={() => {
                                   const url = `${window.location.origin}/pay/${p.checkout_id}`
                                   navigator.clipboard.writeText(url)
-                                  showToast(t("plans.linkCopied"))
+                                  showToast(t("plans.linkCopied"), "success")
                                 }}
                               >
                                 <Copy className="h-4 w-4" />

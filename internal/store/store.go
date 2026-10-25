@@ -70,6 +70,25 @@ const (
 	migrationGrace = 30 * time.Second
 )
 
+// migrationTableLockWait bounds how long one migration waits for a lock
+// on a table it changes. While it waits, every query on that table
+// queues behind it, and so does every query on the tables it has
+// already locked, so a migration stuck behind a long transaction (an
+// export, a session idle in a transaction) would hold up all that
+// traffic for as long as it waited. Instead it gives up quickly, rolls
+// back, and is tried again after migrationLockBackoff; each file runs in
+// one transaction, so a retry starts clean. A deadlock the server breaks
+// against the migration is retried the same way. Variables so tests can
+// shorten them.
+var (
+	migrationTableLockWait = 2 * time.Second
+	migrationLockBackoff   = func(attempt int) time.Duration { return time.Duration(min(attempt, 5)) * time.Second }
+	// migrationLockAttempts is how many times one migration is tried
+	// before RunMigrations gives up: about four and a half minutes with
+	// the above.
+	migrationLockAttempts = 40
+)
+
 // migrationDB opens the connection RunMigrations holds its lock and
 // applies migrations on. The driver bounds every read, at 10 seconds by
 // default, deadline or not, which the store's pool keeps for ordinary
@@ -203,20 +222,20 @@ func (s *Store) RunMigrations(dir string) error {
 		}
 
 		// Apply migration: SQL execution + tracking record in ONE transaction
-		migCtx, cancel := context.WithTimeout(ctx, migrationTimeout+migrationGrace)
+		applyOnce := func() error {
+			migCtx, cancel := context.WithTimeout(ctx, migrationTimeout+migrationGrace)
+			defer cancel()
 
-		tx, err := lockConn.BeginTx(migCtx, nil)
-		if err != nil {
-			cancel()
-			return fmt.Errorf("begin tx for %s: %w", entry.Name(), err)
-		}
-		if _, err := tx.ExecContext(migCtx, fmt.Sprintf("SET LOCAL statement_timeout = %d", migrationTimeout.Milliseconds())); err != nil {
-			_ = tx.Rollback()
-			cancel()
-			return fmt.Errorf("begin tx for %s: %w", entry.Name(), err)
-		}
+			tx, err := lockConn.BeginTx(migCtx, nil)
+			if err != nil {
+				return fmt.Errorf("begin tx for %s: %w", entry.Name(), err)
+			}
+			if _, err := tx.ExecContext(migCtx, fmt.Sprintf("SET LOCAL statement_timeout = %d; SET LOCAL lock_timeout = %d",
+				migrationTimeout.Milliseconds(), migrationTableLockWait.Milliseconds())); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("begin tx for %s: %w", entry.Name(), err)
+			}
 
-		execErr := func() error {
 			if _, err := tx.ExecContext(migCtx, string(data)); err != nil {
 				errMsg := err.Error()
 				// Handle pre-existing objects (from before migration tracking was added)
@@ -247,11 +266,25 @@ func (s *Store) RunMigrations(dir string) error {
 				return fmt.Errorf("commit %s: %w", entry.Name(), err)
 			}
 			return nil
-		}()
+		}
 
-		cancel()
-
+		var execErr error
+		for attempt := 1; ; attempt++ {
+			execErr = applyOnce()
+			if execErr == nil || !(isLockTimeout(execErr) || isDeadlock(execErr)) || attempt == migrationLockAttempts {
+				break
+			}
+			wait := migrationLockBackoff(attempt)
+			slog.Warn("migration could not lock a table in time; retrying",
+				"file", entry.Name(), "attempt", attempt, "lock_wait", migrationTableLockWait, "retry_in", wait,
+				"error", execErr, "long_transactions", s.longTransactions(ctx, lockConn))
+			time.Sleep(wait)
+		}
 		if execErr != nil {
+			if isLockTimeout(execErr) || isDeadlock(execErr) {
+				return fmt.Errorf("%w (a long transaction kept a table locked through %d attempts; end it and restart: %s)",
+					execErr, migrationLockAttempts, s.longTransactions(ctx, lockConn))
+			}
 			return execErr
 		}
 
@@ -263,6 +296,35 @@ func (s *Store) RunMigrations(dir string) error {
 		slog.Info("migrations complete", "applied", applied)
 	}
 	return nil
+}
+
+// longTransactions describes the oldest transactions open on this
+// database, for the log when a migration cannot get its locks: one of
+// them is likely what holds the table.
+func (s *Store) longTransactions(ctx context.Context, conn bun.Conn) string {
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var rows []struct {
+		PID   int    `bun:"pid"`
+		State string `bun:"state"`
+		Age   string `bun:"age"`
+		Query string `bun:"query"`
+	}
+	if err := conn.NewRaw(`SELECT pid, coalesce(state, '') AS state,
+		date_trunc('second', now() - xact_start)::text AS age, left(coalesce(query, ''), 120) AS query
+		FROM pg_stat_activity
+		WHERE datname = current_database() AND pid <> pg_backend_pid() AND xact_start < now() - interval '1 second'
+		ORDER BY xact_start LIMIT 5`).Scan(qctx, &rows); err != nil {
+		return "unknown (" + err.Error() + ")"
+	}
+	if len(rows) == 0 {
+		return "none open now"
+	}
+	parts := make([]string, len(rows))
+	for i, r := range rows {
+		parts[i] = fmt.Sprintf("pid %d %s for %s: %s", r.PID, r.State, r.Age, r.Query)
+	}
+	return strings.Join(parts, "; ")
 }
 
 func checksumBytes(data []byte) string {
@@ -805,29 +867,50 @@ func (s *Store) createLicenseWithSubscription(ctx context.Context, l *model.Lice
 	return tx.Commit()
 }
 
+// FindLicenseByKey finds the licence a key opens: the licence's own key,
+// or a team member's (see Store.MemberKey), which opens the licence the
+// member belongs to and sets KeySeat to their seat. A removed member's
+// key is cleared, so it opens nothing; nor does a member's key while the
+// product has no seats (its type changed), when the team cannot be
+// managed and so a member could not be removed.
 func (s *Store) FindLicenseByKey(ctx context.Context, key string) (*model.License, error) {
 	keyHash := license.HashKey(key)
+	l, err := s.findLicenseWhere(ctx, "license.key_hash = ?", keyHash)
+	if err == nil || !errors.Is(err, sql.ErrNoRows) {
+		return l, err
+	}
+	seat := new(model.Seat)
+	err = s.DB.NewSelect().Model(seat).
+		Where("member_key_hash = ? AND removed_at IS NULL AND accepted_at IS NOT NULL", keyHash).
+		Scan(ctx)
+	if err == nil {
+		l, err := s.findLicenseWhere(ctx, "license.id = ?", seat.LicenseID)
+		if err != nil {
+			return l, err
+		}
+		if l.Product == nil || !model.ProductSupports(l.Product.Type, model.CapSeats) {
+			return nil, sql.ErrNoRows
+		}
+		l.KeySeat = seat
+		return l, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	// Fallback to plaintext for un-migrated keys.
+	return s.findLicenseWhere(ctx, "license.license_key = ?", key)
+}
+
+func (s *Store) findLicenseWhere(ctx context.Context, where string, arg any) (*model.License, error) {
+	// A fresh model each time, so a failed lookup leaves nothing behind.
 	l := new(model.License)
-	err := s.DB.NewSelect().Model(l).
+	return l, s.DB.NewSelect().Model(l).
 		Relation("Product").
 		Relation("Plan").
 		Relation("Plan.Entitlements").
 		Relation("Activations").
-		Where("license.key_hash = ?", keyHash).
+		Where(where, arg).
 		Scan(ctx)
-	if err != nil {
-		// Fallback to plaintext for un-migrated keys — use fresh model
-		// to avoid mixing partial state from the failed hash lookup.
-		l = new(model.License)
-		return l, s.DB.NewSelect().Model(l).
-			Relation("Product").
-			Relation("Plan").
-			Relation("Plan.Entitlements").
-			Relation("Activations").
-			Where("license.license_key = ?", key).
-			Scan(ctx)
-	}
-	return l, nil
 }
 
 func (s *Store) FindLicenseByStripeSubscription(ctx context.Context, subID string) (*model.License, error) {
@@ -1176,7 +1259,8 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 
 func (s *Store) ListLicensesByEmail(ctx context.Context, email string) ([]*model.License, error) {
 	var out []*model.License
-	// Include licenses owned by email OR where user has a seat. Matched
+	// Include licenses owned by email OR where user has a seat they have
+	// accepted: an invite not yet taken up shows nothing. Matched
 	// case-insensitively: a licence keeps the address as it was typed,
 	// and the portal session carries the lower-cased sign-in address.
 	e := normalizeEmail(email)
@@ -1189,7 +1273,7 @@ func (s *Store) ListLicensesByEmail(ctx context.Context, email string) ([]*model
 		Where(`license.id IN (
 			SELECT id FROM licenses WHERE lower(email) = ?
 			UNION ALL
-			SELECT license_id FROM seats WHERE lower(email) = ? AND removed_at IS NULL)`, e, e).
+			SELECT license_id FROM seats WHERE lower(email) = ? AND removed_at IS NULL AND accepted_at IS NOT NULL)`, e, e).
 		OrderExpr("license.created_at DESC, license.id DESC").Scan(ctx)
 	if err != nil {
 		return nil, err
@@ -1287,7 +1371,11 @@ func (s *Store) ListLicenses(ctx context.Context, f LicenseListFilter) ([]*model
 	}
 	if f.Search != "" {
 		// Only search by email and key prefix — never expose full key via wildcard search.
-		q = q.Where("(license.email ILIKE ? OR license.license_key LIKE ?)", "%"+f.Search+"%", f.Search+"%")
+		// A member's address or own key finds the licence they are on,
+		// as the owner's do.
+		q = q.Where(`(license.email ILIKE ? OR license.license_key LIKE ? OR EXISTS (SELECT 1 FROM seats s
+			WHERE s.license_id = license.id AND s.removed_at IS NULL AND (s.email ILIKE ? OR s.member_key LIKE ?)))`,
+			"%"+f.Search+"%", f.Search+"%", "%"+f.Search+"%", f.Search+"%")
 	}
 	total, err := q.Count(ctx)
 	if err != nil {
@@ -2483,6 +2571,14 @@ func stricterSeatLimit(a, b int) int {
 // activation on this license, so nothing was taken from the limit.
 var ErrAlreadyActivated = errors.New("identifier is already activated")
 
+// ErrDeviceMoved is ErrAlreadyActivated for a device ActivateForKey has
+// just moved from the licence's key to the member's.
+var ErrDeviceMoved = fmt.Errorf("%w: moved to the member's key", ErrAlreadyActivated)
+
+// ErrDeviceHeld is returned by ActivateForKey when the machine is the
+// device of another key on the licence.
+var ErrDeviceHeld = errors.New("device held by another key on the licence")
+
 // ActivateWithinLimit takes one activation slot for a machine, or says
 // why it could not.
 //
@@ -2497,7 +2593,35 @@ var ErrAlreadyActivated = errors.New("identifier is already activated")
 // insert hit the unique index on (license_id, identifier), which
 // surfaced as a 500. A client retrying a timed-out activation, or an
 // app opened twice, met one or the other.
+//
+// It checks no key. Every path a client reaches goes through
+// ActivateForKey, which re-checks the key it was given under the same
+// lock; this one is for callers that hold none, such as tests.
 func (s *Store) ActivateWithinLimit(ctx context.Context, act *model.Activation, maxActivations int) error {
+	return s.activateWithinLimit(ctx, act, maxActivations, "")
+}
+
+// ActivateForKey is ActivateWithinLimit for a client presenting key, the
+// member's key when act.SeatID is set, else the licence's own (see
+// FindLicenseByKey). A key that stopped opening the licence since it was
+// looked up (its member removed or their accept rolled back, the
+// licence's key changed, the product's seats gone) is refused with
+// ErrKeyRevoked: each of those takes the licence row lock this decides
+// under, or is re-checked under it, so no device is left on a key that
+// no longer works. A machine already
+// activated stays whoever's activated it: another key holder's key is
+// refused with ErrDeviceHeld, as for a floating session, while the
+// licence's own key, which manages every device, finds it activated.
+// The one move is a device activated with the licence's key before
+// members had keys of their own (PredatesMemberKeys), when members
+// used that key: it moves, once, to the member whose key activates it,
+// so a member who used the shared key carries their machine onto their
+// own and a change of the licence's key later leaves it alone.
+func (s *Store) ActivateForKey(ctx context.Context, act *model.Activation, maxActivations int, key string) error {
+	return s.activateWithinLimit(ctx, act, maxActivations, key)
+}
+
+func (s *Store) activateWithinLimit(ctx context.Context, act *model.Activation, maxActivations int, key string) error {
 	if act.ID == "" {
 		act.ID = newID()
 	}
@@ -2519,18 +2643,57 @@ func (s *Store) ActivateWithinLimit(ctx context.Context, act *model.Activation, 
 		maxActivations = min(maxActivations, held)
 	}
 
+	if key != "" {
+		held, err := keyHeldIn(ctx, tx, act.LicenseID, act.SeatID, key)
+		if err != nil {
+			return err
+		}
+		if !held {
+			return ErrKeyRevoked
+		}
+	}
+
 	// This machine may already hold a slot, in which case it is not
 	// competing for one.
-	var existingID string
-	switch err := tx.NewRaw(
-		"SELECT id FROM activations WHERE license_id = ? AND identifier = ?",
+	var existing []struct {
+		ID                 string         `bun:"id"`
+		SeatID             sql.NullString `bun:"seat_id"`
+		PredatesMemberKeys bool           `bun:"predates_member_keys"`
+	}
+	// FOR UPDATE: a release of the device, which takes no licence lock,
+	// waits for this decision rather than slipping in between the read
+	// and a move.
+	if err := tx.NewRaw(
+		"SELECT id, seat_id, predates_member_keys FROM activations WHERE license_id = ? AND identifier = ? FOR UPDATE",
 		act.LicenseID, act.Identifier,
-	).Scan(ctx, &existingID); {
-	case err == nil && existingID != "":
-		act.ID = existingID
-		return ErrAlreadyActivated
-	case err != nil && !errors.Is(err, sql.ErrNoRows):
+	).Scan(ctx, &existing); err != nil {
 		return err
+	}
+	if len(existing) > 0 {
+		act.ID = existing[0].ID
+		holder := existing[0].SeatID
+		switch {
+		case key == "" || act.SeatID == "" || holder.String == act.SeatID:
+			return ErrAlreadyActivated
+		case holder.Valid || !existing[0].PredatesMemberKeys:
+			return ErrDeviceHeld
+		}
+		res, err := tx.NewRaw(`UPDATE activations SET seat_id = ?, predates_member_keys = false
+			WHERE id = ? AND seat_id IS NULL AND predates_member_keys`, act.SeatID, act.ID).Exec(ctx)
+		if err != nil {
+			return err
+		}
+		moved, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		if moved != 1 {
+			return ErrAlreadyActivated
+		}
+		return ErrDeviceMoved
 	}
 
 	// Now safely count existing activations
@@ -2902,16 +3065,31 @@ func (s *Store) BackfillLicenseKeyEncrypted(ctx context.Context, logger *slog.Lo
 			break
 		}
 	}
-	return total, nil
+	// Members' keys, made before encryption was turned on.
+	members, memberFailures, err := s.backfillMemberKeysEncrypted(ctx, logger)
+	total += members
+	if members > 0 || memberFailures > 0 {
+		logger.Info("member key backfill", "encrypted", members, "failed", memberFailures)
+	}
+	if remaining, err := s.countLicenseKeysUnencrypted(ctx); err == nil {
+		LicenseKeysUnencrypted.Set(float64(remaining))
+	}
+	return total, err
 }
 
-// countLicenseKeysUnencrypted returns how many rows still need backfill.
-// Used to drive the LicenseKeysUnencrypted gauge — Phase B should not
-// flip the read path until this metric is 0 for sustained time.
+// countLicenseKeysUnencrypted returns how many rows still need backfill,
+// members' keys included. Used to drive the LicenseKeysUnencrypted
+// gauge — Phase B should not flip the read path until this metric is 0
+// for sustained time.
 func (s *Store) countLicenseKeysUnencrypted(ctx context.Context) (int, error) {
-	return s.DB.NewSelect().Model((*model.License)(nil)).
+	licences, err := s.DB.NewSelect().Model((*model.License)(nil)).
 		Where("license_key_encrypted IS NULL AND license_key <> ''").
 		Count(ctx)
+	if err != nil {
+		return 0, err
+	}
+	members, err := s.DB.NewSelect().Model((*model.Seat)(nil)).Where(unencryptedMemberKeys).Count(ctx)
+	return licences + members, err
 }
 
 // ─── License Renewals (maintenance period) ───

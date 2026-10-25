@@ -33,6 +33,9 @@ type AdminHandler struct {
 	Email   *service.EmailService
 	Expiry  *service.ExpiryChecker
 	Metered *service.MeteredBillingSyncer
+	// Seats removes a licence's seats for the admin as the owner would
+	// in the portal: one path for webhooks and audit.
+	Seats *service.SeatService
 	// FeedURLTTL is how long a presigned artifact URL inside a public
 	// update feed stays usable (STORAGE_FEED_URL_TTL). Gating a
 	// product's feeds does not reach links already handed out, so an
@@ -2226,6 +2229,10 @@ func (h *AdminHandler) GetLicense(c *gin.Context) {
 	// rides alongside them; the key itself is one explicit request
 	// away via RevealLicenseKey.
 	model.FillLimits(l)
+	if err := h.Store.FillMemberEmails(c, l.Activations); err != nil {
+		response.Internal(c, err)
+		return
+	}
 	out := licenseWithHint{License: l, KeyUsable: true}
 	out.LicenseKeyPrefix, out.LicenseKeyHint = h.licenseKeyHint(l)
 	if err := service.LicenseUsable(l); err != nil {
@@ -2445,7 +2452,11 @@ func apperrCode(err error) string {
 // licenseKeyHint is the last four characters of a key — a row label,
 // not a credential — and the prefix of the product that issued it.
 func (h *AdminHandler) licenseKeyHint(l *model.License) (prefix, hint string) {
-	key := h.Store.DecryptLicenseKey(l)
+	return keyHint(h.Store.DecryptLicenseKey(l))
+}
+
+// keyHint is a key's prefix and last four characters.
+func keyHint(key string) (prefix, hint string) {
 	r := []rune(key)
 	if len(r) <= 4 {
 		return "", string(r)
@@ -3337,23 +3348,6 @@ func (h *AdminHandler) ResetLicenseUsage(c *gin.Context) {
 	response.OK(c, gin.H{"status": "reset"})
 }
 
-// ─── Seats (admin) ───
-
-func (h *AdminHandler) ListLicenseSeats(c *gin.Context) {
-	id := c.Param("id")
-	if !h.checkLicenseScope(c, id) {
-		return
-	}
-	page := listPage(c)
-	seats, total, err := h.Store.ListSeats(c, id, page)
-	if err != nil {
-		response.Internal(c, err)
-		return
-	}
-	count, _ := h.Store.CountActiveSeats(c, id)
-	listOK(c, "seats", seats, total, page, gin.H{"active_count": count})
-}
-
 // ─── Analytics (admin) ───
 
 func (h *AdminHandler) ListAnalytics(c *gin.Context) {
@@ -3522,11 +3516,22 @@ func (h *AdminHandler) GetUserDetail(c *gin.Context) {
 	// its existing shape and the hints ride alongside it.
 	hints, prefixes := h.licenseKeyHints(detail.Licenses)
 	model.FillLimits(detail.Licenses...)
+	// A membership shows the member's own key, the one they use, by the
+	// same hint.
+	memberHints, memberPrefixes := make(map[string]string), make(map[string]string)
+	for _, seat := range detail.Memberships {
+		if prefix, hint := keyHint(h.Store.DecryptMemberKey(seat)); hint != "" {
+			memberHints[seat.ID], memberPrefixes[seat.ID] = hint, prefix
+		}
+	}
 	response.OK(c, struct {
 		*store.UserDetail
 		LicenseKeyHints    map[string]string `json:"license_key_hints"`
 		LicenseKeyPrefixes map[string]string `json:"license_key_prefixes"`
-	}{UserDetail: detail, LicenseKeyHints: hints, LicenseKeyPrefixes: prefixes})
+		MemberKeyHints     map[string]string `json:"member_key_hints"`
+		MemberKeyPrefixes  map[string]string `json:"member_key_prefixes"`
+	}{UserDetail: detail, LicenseKeyHints: hints, LicenseKeyPrefixes: prefixes,
+		MemberKeyHints: memberHints, MemberKeyPrefixes: memberPrefixes})
 }
 
 // ─── Addons ───

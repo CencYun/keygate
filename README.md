@@ -72,9 +72,9 @@ Free plans can take **self sign-up**: the plan's `/pay` link becomes a form wher
 
 A license on a free plan shows **Upgrade** in the portal: the customer pays for a paid plan of the same product through checkout, and that same license moves to it — same key, same activations, no re-install. A full refund, or the end of the subscription, puts it back on the free plan instead of revoking it.
 
-### 👥 Team Seats & Entitlements
+### 👥 Seats & Entitlements
 
-Customers manage their own teams within a license. Seat roles (owner/admin/member), configurable limits per plan, or plans sold per seat through Stripe, with customers adding or removing seats in the portal. Feature entitlements as boolean flags, numeric limits, or usage quotas. Purchasable add-ons that extend plan capabilities.
+A license holds a number of seats: set per plan, or sold per seat through Stripe, with customers adding or removing seats in the portal. The buyer owns the license and holds one seat, and invites members to the others; each member gets a license key of their own, and removing a member stops their key and frees their devices. The license's own key stays fixed once issued; an admin reissues it when needed. Feature entitlements as boolean flags, numeric limits, or usage quotas. Purchasable add-ons that extend plan capabilities.
 
 ### 🔧 Server-to-Server API
 

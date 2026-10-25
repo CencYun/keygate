@@ -14,9 +14,11 @@ export default function AcceptInvitePage() {
   const token = params.get("token") || ""
 
   // Backend collapses bad/expired/already-accepted into one error
-  // shape so we don't try to distinguish the failure reason here.
+  // shape so we don't try to distinguish the failure reason here. The
+  // page shows the failure itself, so the global toast stays out of it.
   const acceptMut = useMutation({
     mutationFn: () => invites.accept(token),
+    meta: { ownErrors: true },
   })
 
   // Fire exactly once per distinct token. StrictMode double-invokes
@@ -85,8 +87,6 @@ export default function AcceptInvitePage() {
   }
 
   const data = acceptMut.data!
-  const productName = data.product_name || "the team"
-  const roleLabel = data.role === "admin" ? t("portal.roleAdmin") : t("portal.roleMember")
 
   return (
     <Shell>
@@ -94,9 +94,11 @@ export default function AcceptInvitePage() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <CheckCircle2 className="h-5 w-5 text-emerald-600" />
-            {t("acceptInvite.acceptedTitle").replace("{product}", productName)}
+            {data.product_name
+              ? t("acceptInvite.acceptedTitle").replace("{product}", data.product_name)
+              : t("acceptInvite.acceptedTitleNoProduct")}
           </CardTitle>
-          <CardDescription>{t("acceptInvite.acceptedDesc").replace("{role}", roleLabel)}</CardDescription>
+          <CardDescription>{t("acceptInvite.acceptedDesc")}</CardDescription>
         </CardHeader>
         <CardContent>
           <Button asChild>

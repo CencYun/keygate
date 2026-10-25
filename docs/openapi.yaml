@@ -19,6 +19,22 @@ info:
     `X-License-Key` parameters). Trust in the artifacts comes from the
     per-product Ed25519 signature on each one, not from URL secrecy.
 
+    **Members' keys.** Each accepted member of a license has a license key
+    of their own, shown to them in the portal. It works wherever the
+    license's key does and opens the same license, but keeps to the
+    member's own devices and floating sessions: each records whose key
+    made it, and a member's key verifies, releases or renews only its
+    own. A device or session stays whoever's key made it; the license's
+    key manages all of them. The one exception is a device activated
+    with the license's key before members had keys of their own, when
+    members shared that key: it moves, once, to the member whose own key
+    activates it. Removing the member clears the key and removes their
+    devices and sessions. A member's key works only while the product
+    has seats (a SaaS or hybrid product): should its type change to one
+    without, member keys answer as unknown keys until it changes back. The owner keeps the
+    license's own key, which does not change once issued; only an admin
+    reissues it (`POST /admin/licenses/{id}/rotate-key`).
+
     **Customers (portal session).** `/portal/*` and `POST
     /auth/logout` need a signed-in customer. A sign-in (`POST
     /auth/otp/verify`, `POST /signup/{checkout_id}/verify`, `POST
@@ -189,7 +205,7 @@ tags:
   - name: Usage
     description: Record and query usage against quotas
   - name: Seats
-    description: Manage team members on a license
+    description: Manage the members of a license
   - name: Floating
     description: Concurrent session checkout for floating licenses
   - name: Releases
@@ -327,7 +343,13 @@ paths:
         Returns a signed verification token.
 
         - Re-activating the same identifier returns `already_activated`
-          without consuming an additional slot
+          without consuming an additional slot. A device stays whoever's
+          key activated it: a member's key on a device of another
+          key on the license (another member's, or the license's own) is
+          refused with `409 DEVICE_HELD`, while the license's key finds
+          any device activated. The one move is a device activated with
+          the license's key before members had keys of their own: it
+          moves, once, to the member whose key activates it.
         - Atomic enforcement of the plan's `max_activations`, times the
           seats bought on a plan sold per seat (concurrent retries can
           never exceed the cap)
@@ -397,6 +419,7 @@ paths:
           description: |
             - `ACTIVATION_LIMIT`: slots exhausted, `details: {"max": 3, "current": 3}`
             - `FLOATING_LICENSE`: the plan is floating; use floating checkout
+            - `DEVICE_HELD`: a member's key on the device of another key on the license; the license owner can remove that device in the portal, after which the member activates it as their own
             - `IDEMPOTENCY_IN_FLIGHT`: concurrent retry, try again (`Retry-After: 1`)
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "413":
@@ -412,7 +435,13 @@ paths:
       summary: Verify a license activation
       description: |
         Checks that a license is usable and the identifier is activated.
-        Returns the license status, plan features, and a signed token.
+        Returns the license status, plan features, and a signed token. A
+        member's key verifies only that member's devices; another
+        device, including one on the license's key, answers as an unknown
+        key would. A device on the license's key from before members had
+        keys of their own moves to the member when they activate it with
+        their key; any other answers that activation with `409
+        DEVICE_HELD`.
 
         The signed token can be verified offline using the server's
         Ed25519 public key (`GET /license/pubkey`). Token format is
@@ -470,8 +499,10 @@ paths:
         Removes an activation, freeing a slot for a new device, and sends
         the `license.deactivated` webhook. The license's status is not
         checked: a suspended, revoked or expired license can still free
-        its slots. `identifier` is trimmed first; blank or longer than
-        256 bytes is refused with 400.
+        its slots. A member's key removes only that member's
+        devices; another device answers as an unknown key would.
+        `identifier` is trimmed first; blank or longer than 256 bytes is
+        refused with 400.
       requestBody:
         required: true
         content:
@@ -683,7 +714,12 @@ paths:
 
         - Atomic: concurrent checkouts will never exceed the plan's
           `max_activations` (times the seats bought, on a plan sold per seat)
-        - Re-checkout with the same identifier refreshes the existing session
+        - Re-checkout with the same identifier refreshes the existing session.
+          A running session stays whoever's key checked it out: the
+          license's key renews any, a member's key renews its own,
+          and any other running session is refused with `409
+          SESSION_HELD`. Sessions never move; once one lapses, the
+          machine goes to whoever checks it out next.
         - `identifier` and `label` are trimmed first. A blank identifier,
           one longer than 256 bytes, or a label longer than 256
           characters is refused with 400.
@@ -727,6 +763,7 @@ paths:
         "409":
           description: |
             - `FLOATING_LIMIT`: all sessions in use, `details: {"active": 5, "max": 5}`
+            - `SESSION_HELD`: this machine's running session was checked out with another key on the license
             - `IDEMPOTENCY_IN_FLIGHT` (`Retry-After: 1`)
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "413":
@@ -741,9 +778,10 @@ paths:
       tags: [Floating]
       summary: Release a floating session
       description: |
-        Releases the identifier's session. Answers 200 whether or not a
-        session was held. `identifier` is trimmed first; blank or longer
-        than 256 bytes is refused with 400.
+        Releases the identifier's session. A member's key releases
+        only that member's session. Answers 200 whether or not a session
+        was held (or released). `identifier` is trimmed first; blank or
+        longer than 256 bytes is refused with 400.
       requestBody:
         required: true
         content:
@@ -791,7 +829,8 @@ paths:
         When the identifier holds no live session (it never checked out,
         or its session lapsed and the slot may have gone to another
         machine), the answer is `404 SESSION_NOT_FOUND`: check out again
-        before continuing. `identifier` is trimmed first; blank or longer
+        before continuing. A member's key renews only that member's
+        session; another's answers the same. `identifier` is trimmed first; blank or longer
         than 256 bytes is refused with 400.
       requestBody:
         required: true
@@ -963,9 +1002,10 @@ paths:
           the portal in one click
 
         All failure modes (unknown / expired / removed / already
-        accepted token, or a license that is suspended / revoked /
-        canceled / expired) collapse to one opaque
-        `404 SEAT_INVITE_INVALID` so an attacker can't probe token
+        accepted token, or a license not usable now: suspended, revoked
+        or expired, past its end plus the plan's grace days, or canceled
+        and past its end; the rule an invite is held to) collapse to one
+        opaque `404 SEAT_INVITE_INVALID` so an attacker can't probe token
         validity by response shape. When a policy check fails (e.g.
         license suspended at accept time), the seat row is rolled
         back to its pre-accept state and the token is consumed
@@ -1000,9 +1040,9 @@ paths:
                       email: { type: string, format: email }
                       license_id: { type: string, format: uuid }
                       product_name: { type: string }
-                      role: { type: string, enum: [admin, member] }
+                      role: { type: string, enum: [member] }
         "404":
-          description: Invalid, expired, already-used, or removed token (`SEAT_INVITE_INVALID`)
+          description: Invalid, expired, already-used, or removed token, or a license not usable now (`SEAT_INVITE_INVALID`)
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "429":
           $ref: "#/components/responses/RateLimited"
@@ -1803,13 +1843,20 @@ paths:
       summary: The signed-in user's licenses
       description: |
         Licenses whose email is the user's (case-insensitive), plus
-        licenses on which the user holds a seat that was not removed. A
-        bounded list with no paging, newest first, served with
-        `Cache-Control: no-store`.
+        licenses on which the user holds an accepted seat that was not
+        removed; an invite not yet accepted lists nothing. A bounded list
+        with no paging, newest first, served with `Cache-Control:
+        no-store`.
 
         Unlike admin payloads, each item carries the plaintext
-        `license_key`: it is the customer's own credential, shown in the
-        portal and used to address the activation and seat endpoints.
+        `license_key`: the caller's own credential, shown in the portal
+        and used to address the activation and seat endpoints. That is
+        the license's key for its owner, and for a member their
+        own key, made the first time they get here. A member gets only
+        their own devices in `activations`; `activation_count` is the
+        whole license's. A member's `seats` holds the members who have
+        joined; pending invitations are listed to the owner alone. A member is not listed a license while its product
+        has no seats (its type changed), as their key opens nothing then.
       security:
         - CookieAuth: []
       responses:
@@ -1947,8 +1994,8 @@ paths:
       description: |
         The same operation as `POST /license/usage` (same body, response
         and errors, except that it has no idempotency layer), for a
-        license the signed-in user owns or holds a seat on. A seat counts
-        whether or not its invitation was accepted. A license that exists
+        license the signed-in user owns or holds an accepted seat on; an
+        invitation not yet accepted gives no access. A license that exists
         but is not the user's answers the same `404 LICENSE_NOT_FOUND` as
         one that does not exist. The body is capped at 64 KiB.
       security:
@@ -1997,7 +2044,7 @@ paths:
       summary: Get quota status from a portal session
       description: |
         The same operation as `POST /license/usage/status`, for a license
-        the signed-in user owns or holds a seat on (accepted or not). A
+        the signed-in user owns or holds an accepted seat on. A
         license that exists but is not the user's answers the same `404
         LICENSE_NOT_FOUND` as one that does not exist. The body is capped
         at 64 KiB.
@@ -2032,7 +2079,7 @@ paths:
           $ref: "#/components/responses/PortalBodyTooLarge"
 
   # Seat management moved off the SDK namespace (license_key is the
-  # device credential, not a team-management credential). All three
+  # device credential, not a seat-management credential). All three
   # endpoints live under /portal and are gated by the portal session
   # cookie; the license_key in the body only NAMES the target license,
   # the cookie is what authenticates.
@@ -2042,10 +2089,13 @@ paths:
       summary: List seats on a license (portal)
       description: |
         Returns the seats (not removed) of a license the signed-in user
-        owns or holds a seat on, accepted or not. A license that exists
-        but is not the user's answers the same `404 LICENSE_NOT_FOUND`,
-        code included, as one that does not exist. The body is capped at
-        64 KiB.
+        owns or holds an accepted seat on, whatever the license's state,
+        so an owner sees whom to remove while it is suspended or lapsed.
+        The owner gets pending invitations too; a member gets only the
+        members who have joined, not the addresses invitations went to.
+        A license that exists but is not the user's answers the same `404
+        LICENSE_NOT_FOUND`, code included, as one that does not exist. The
+        body is capped at 64 KiB.
       security:
         - CookieAuth: []
       requestBody:
@@ -2079,7 +2129,7 @@ paths:
         "401":
           $ref: "#/components/responses/SessionRequired"
         "404":
-          description: "`LICENSE_NOT_FOUND`: unknown, not the user's, not usable now, or a product without seats"
+          description: "`LICENSE_NOT_FOUND`: unknown, not the user's, or a product without seats"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "413":
           $ref: "#/components/responses/PortalBodyTooLarge"
@@ -2087,17 +2137,21 @@ paths:
   /portal/seats/add:
     post:
       tags: [Seats, Portal]
-      summary: Invite a team member (portal)
+      summary: Invite a member (portal)
       description: |
-        Adds a seat to the license. Only the license owner OR an
-        accepted seat with role `admin` may call this; anyone else gets
-        the same `404 LICENSE_NOT_FOUND` as for an unknown license. Seat
-        roles are 2-tier: the license owner (matched by `license.email`)
-        is implicit and never has a seat row of their own.
+        Adds a seat to the license. A license has its owner, who manages
+        its members, and members, who use it: only the license owner
+        (matched by `license.email`, and never a seat row of their own)
+        may call this. Anyone else, members included, gets the same `404
+        LICENSE_NOT_FOUND` as for an unknown license.
         Idempotent: adding the same email twice with the seat
-        still pending rotates the invite token and re-sends the
-        email; if the seat is already accepted, returns the existing
-        seat with no email re-send.
+        still pending sends the invitation again: the invite token is
+        rotated (the earlier link stops working), its expiry and
+        `invited_at` renewed, and the email re-sent, even at the seat
+        limit, since the seat is already counted. No seat is added, so
+        `seat.added` does not fire. This is how the portal resends an
+        invitation. If the seat is already accepted, returns the
+        existing seat with no email re-send.
 
         Cannot invite the license owner's own email (400). Enforces
         the license's seat limit (`seat_limit` on the license: the
@@ -2128,16 +2182,18 @@ paths:
                   format: email
                 role:
                   type: string
-                  enum: [admin, member]
+                  enum: [member]
                   default: member
                   description: |
-                    Seat-level role. `admin` may invite/remove other
-                    seats; `member` may only use the license. The
-                    license owner (identified by `license.email`) is
-                    implicit and never has a seat row of their own.
+                    Always `member`, and may be left out. Seats no longer
+                    have an admin role; any other value is refused with 400.
       responses:
         "200":
-          description: Seat added, restored, or already exists
+          description: |
+            The seat: added, restored, sent again (still pending), or
+            already a member. Which it was is not in the response; it is
+            the `outcome` of the `seat.added` webhook (created or
+            restored) and of the audit log entry.
           content:
             application/json:
               schema:
@@ -2151,7 +2207,7 @@ paths:
         "401":
           $ref: "#/components/responses/SessionRequired"
         "404":
-          description: "`LICENSE_NOT_FOUND`: unknown or unusable license, a product without seats, or the caller lacks mutation rights"
+          description: "`LICENSE_NOT_FOUND`: unknown or unusable license, a product without seats, or the caller is not the license owner"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "409":
           description: "`SEAT_LIMIT`: every seat is taken (`details: {max, current}`, both counting the owner). `UPGRADE_IN_PROGRESS`: a checkout upgrading the license to a plan sold per seat is open (it lapses within an hour)"
@@ -2162,12 +2218,18 @@ paths:
   /portal/seats/remove:
     post:
       tags: [Seats, Portal]
-      summary: Remove a team member (portal)
+      summary: Remove a member (portal)
       description: |
         Soft-removes a seat (sets `removed_at`) and sends the
-        `seat.removed` webhook. Same auth rules as `/portal/seats/add`:
-        license owner or accepted admin seat only. The body is capped at
-        64 KiB.
+        `seat.removed` webhook. The member's own key stops working at
+        once, and their devices and floating sessions are removed in the
+        same transaction, each device with a `license.deactivated`
+        webhook. Same auth
+        rules as `/portal/seats/add`: the license owner only. It works
+        whatever the license's state, so an owner takes access away from
+        a suspended or lapsed license and a renewal does not hand it back.
+        Removing a seat already removed changes nothing and sends no
+        webhook. The body is capped at 64 KiB.
       security:
         - CookieAuth: []
       requestBody:
@@ -2202,8 +2264,8 @@ paths:
           $ref: "#/components/responses/SessionRequired"
         "404":
           description: |
-            `LICENSE_NOT_FOUND` (unknown or unusable license, or the
-            caller lacks mutation rights) or `SEAT_NOT_FOUND` (no such
+            `LICENSE_NOT_FOUND` (unknown license, a product without seats,
+            or the caller is not its owner) or `SEAT_NOT_FOUND` (no such
             seat on this license)
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "413":
@@ -2216,9 +2278,11 @@ paths:
       description: |
         For the license owner, or a user holding an accepted seat on it
         (a pending invitation does not count here). Anyone else gets the
-        same 404 as for an unknown key. The license key is in the path:
-        the server redacts that segment before logging, and a client's
-        own logging should too.
+        same 404 as for an unknown key. The owner gets every device and
+        whose key activated each; a member gets the devices their own key
+        activated. The license key (the license's,
+        or a member's own) is in the path: the server redacts that
+        segment before logging, and a client's own logging should too.
       security:
         - CookieAuth: []
       parameters:
@@ -2247,6 +2311,12 @@ paths:
                             ip_address: { type: string }
                             created_at: { type: string, format: date-time }
                             last_verified: { type: string, format: date-time }
+                            seat_id:
+                              type: string
+                              description: The member whose own key activated the device; absent for the license's key
+                            member_email:
+                              type: string
+                              description: That member's address
                       max:
                         type: integer
                         description: The license's device limit (the plan's `max_activations`, times the seats bought on a plan sold per seat); 0 when there is none
@@ -2261,8 +2331,8 @@ paths:
       tags: [Portal]
       summary: Remove an activation (free a device slot)
       description: |
-        Same access rule as the list. Sends the `license.deactivated`
-        webhook.
+        Same access rule as the list: a member removes only the devices
+        their own key activated. Sends the `license.deactivated` webhook.
       security:
         - CookieAuth: []
       parameters:
@@ -2287,7 +2357,7 @@ paths:
         "401":
           $ref: "#/components/responses/SessionRequired"
         "404":
-          description: "`NOT_FOUND`: unknown key, not the user's license, or no such activation on it"
+          description: "`NOT_FOUND`: unknown key, not the user's license, or no such activation on it the user may remove"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
 
   /portal/subscription/change-plan:
@@ -2933,7 +3003,7 @@ paths:
 
         For a plan sold per seat, checkout starts at the people already on
         the license (or the plan's minimum, if higher) and cannot go below
-        that; a team larger than the plan's maximum is refused with
+        that; more people than the plan's maximum is refused with
         `SEATS_IN_USE`. While that checkout is open nobody new can be
         invited (`UPGRADE_IN_PROGRESS` on `POST /portal/seats/add`); should
         the license hold more people than the seats bought all the same,
@@ -3013,7 +3083,12 @@ paths:
         - { name: status, in: query, schema: { $ref: "#/components/schemas/LicenseStatus" } }
         - name: search
           in: query
-          description: Free-text search over the list
+          description: |
+            Free-text search over the list: the owner's address or the
+            license key's start, and likewise the address of a member or
+            of an invitation not yet accepted, or the start of a member's
+            own key, which finds the license they are on. Removed seats
+            are not searched.
           schema: { type: string }
         - { name: external_customer_id, in: query, schema: { type: string } }
         - { name: external_workspace_id, in: query, schema: { type: string } }
@@ -3291,6 +3366,48 @@ paths:
         "503":
           description: "`LICENSE_KEY_UNAVAILABLE`: the stored key could not be decrypted"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /admin/licenses/{id}/rotate-key:
+    post:
+      tags: [Admin Licenses]
+      summary: Replace a license key
+      description: |
+        Requires the `admin` or `licenses:write` scope; a bound key only
+        for its product's licenses. A license's key does not change once
+        issued; this is how the vendor reissues one, as when it got out,
+        and customers have no endpoint for it. A new key with the
+        product's current prefix: the old one stops at once and the
+        devices and floating sessions on it are removed (each device with
+        a `license.deactivated` webhook), and members keep their own
+        keys, devices and sessions. The owner is not told; `POST
+        /admin/licenses/{id}/resend-email` sends them the new key. Returns the new key with `Cache-Control:
+        no-store`; the change, never the key, is written to the audit
+        log. No request body.
+      x-required-scopes: [admin, "licenses:write"]
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/LicenseID"
+      responses:
+        "200":
+          description: The new key
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    $ref: "#/components/schemas/RotatedLicenseKey"
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminForbidden"
+        "404":
+          $ref: "#/components/responses/AdminLicenseNotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
 
   /admin/licenses/{id}/resend-email:
     post:
@@ -3940,7 +4057,10 @@ paths:
         first. `active_count` is the number of members: it leaves out the
         owner, who holds a seat without a row, and a seat at the owner's
         own address. The people counted against the license's seat limit
-        (`seat_limit`) are `active_count + 1`.
+        (`seat_limit`) are `active_count + 1`. Each seat carries its
+        member's own key by its prefix and last four characters (absent
+        until they have a key; listing never makes one) and how many
+        devices that key activated.
       x-required-scopes: [admin, "licenses:write"]
       security:
         - BearerAuth: []
@@ -3965,7 +4085,14 @@ paths:
                         properties:
                           seats:
                             type: array
-                            items: { $ref: "#/components/schemas/Seat" }
+                            items:
+                              allOf:
+                                - $ref: "#/components/schemas/Seat"
+                                - type: object
+                                  properties:
+                                    key_prefix: { type: string }
+                                    key_hint: { type: string, description: Last four characters of the member's own key }
+                                    device_count: { type: integer }
                           active_count: { type: integer }
         "401":
           $ref: "#/components/responses/AdminUnauthorized"
@@ -3973,6 +4100,138 @@ paths:
           $ref: "#/components/responses/AdminForbidden"
         "404":
           $ref: "#/components/responses/AdminLicenseNotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /admin/licenses/{id}/seats/{seat_id}:
+    delete:
+      tags: [Admin Licenses]
+      summary: Remove a member or cancel an invitation
+      description: |
+        Requires the `admin` or `licenses:write` scope; a bound key only
+        for its product's licenses. What the owner's `POST
+        /portal/seats/remove` does, for support: the member's own key
+        stops working, the devices and floating sessions it took are
+        removed (`seat.removed`, and `license.deactivated` for each
+        device), and the removal is audited as the admin's. Works
+        whatever the license's state. Removing a seat already removed
+        answers the same, and fires nothing again.
+      x-required-scopes: [admin, "licenses:write"]
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/LicenseID"
+        - { name: seat_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      status: { type: string, example: removed }
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminForbidden"
+        "404":
+          description: "`NOT_FOUND`: unknown license; `SEAT_NOT_FOUND`: no such seat on it"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /admin/licenses/{id}/seats/{seat_id}/key:
+    get:
+      tags: [Admin Licenses]
+      summary: Reveal a member's key
+      description: |
+        Requires the `admin` or `licenses:write` scope; a bound key only
+        for its product's licenses. The member's own key in full, as `GET
+        /admin/licenses/{id}/key` gives the license's: with
+        `Cache-Control: no-store`, and each reveal written to the audit
+        log without the key. A member who has not opened the portal yet
+        has their key made here, as the portal would make it.
+      x-required-scopes: [admin, "licenses:write"]
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/LicenseID"
+        - { name: seat_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The member's key
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      license_key: { type: string }
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminForbidden"
+        "404":
+          description: "`NOT_FOUND`: unknown license; `SEAT_NOT_FOUND`: no such seat on it"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: "`SEAT_NOT_JOINED`: an invitation not yet accepted, or a removed seat; it has no key"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /admin/licenses/{id}/seats/{seat_id}/rotate-key:
+    post:
+      tags: [Admin Licenses]
+      summary: Reissue a member's key
+      description: |
+        Requires the `admin` or `licenses:write` scope; a bound key only
+        for its product's licenses. Gives the member a new key of their
+        own, as `POST /admin/licenses/{id}/rotate-key` does the
+        license's: the old one stops at once, the devices and floating
+        sessions it took are removed (each device with a
+        `license.deactivated` webhook), and the owner's and other
+        members' keys and devices stay. The member sees the new key in
+        the portal; the response carries it too, with `Cache-Control:
+        no-store`. Audited without the key. No request body.
+      x-required-scopes: [admin, "licenses:write"]
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/LicenseID"
+        - { name: seat_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The member's new key
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    $ref: "#/components/schemas/RotatedLicenseKey"
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminForbidden"
+        "404":
+          description: "`NOT_FOUND`: unknown license; `SEAT_NOT_FOUND`: no such seat on it"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: "`SEAT_NOT_JOINED`: an invitation not yet accepted, or a removed seat; it has no key"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "429":
           $ref: "#/components/responses/RateLimited"
 
@@ -5178,7 +5437,13 @@ webhooks:
       summary: An activation was removed
       description: |
         Sent by `POST /license/deactivate`, by the customer removing a
-        device in the portal, and by `DELETE /admin/activations/{id}`.
+        device in the portal, by `DELETE /admin/activations/{id}`, and for
+        each device that goes with a removed member (`POST
+        /portal/seats/remove`, `DELETE
+        /admin/licenses/{id}/seats/{seat_id}`), with a reissued license
+        key (`POST /admin/licenses/{id}/rotate-key`) or member key (`POST
+        /admin/licenses/{id}/seats/{seat_id}/rotate-key`), or with a
+        rolled-back `POST /invites/accept`.
       parameters:
         - $ref: "#/components/parameters/WebhookEventHeader"
         - $ref: "#/components/parameters/WebhookSignatureHeader"
@@ -5582,7 +5847,8 @@ webhooks:
       summary: A seat was added or restored
       description: |
         Sent by `POST /portal/seats/add` when it creates a seat or
-        restores a removed one; not when the seat already existed.
+        restores a removed one; not when the seat already existed, nor
+        when a pending invitation is sent again.
       parameters:
         - $ref: "#/components/parameters/WebhookEventHeader"
         - $ref: "#/components/parameters/WebhookSignatureHeader"
@@ -5601,7 +5867,7 @@ webhooks:
                         license_id: { type: string, format: uuid }
                         seat_id: { type: string, format: uuid }
                         email: { type: string }
-                        role: { type: string, enum: [admin, member] }
+                        role: { type: string, enum: [member] }
                         outcome: { type: string, enum: [created, restored] }
       responses:
         "200":
@@ -5611,6 +5877,12 @@ webhooks:
     post:
       tags: [Webhooks]
       summary: A seat was removed
+      description: |
+        Sent when the license owner removes a member or cancels a pending
+        invitation (`POST /portal/seats/remove`), or an admin does
+        (`DELETE /admin/licenses/{id}/seats/{seat_id}`), once: removing a seat
+        already removed sends nothing. Each device that went with a
+        member follows as its own `license.deactivated`.
       parameters:
         - $ref: "#/components/parameters/WebhookEventHeader"
         - $ref: "#/components/parameters/WebhookSignatureHeader"
@@ -6411,6 +6683,18 @@ components:
         ip_address: { type: string }
         last_verified: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
+        seat_id:
+          type: string
+          description: The member whose own key activated the device; absent for the license's key
+        member_email:
+          type: string
+          description: That member's address, where devices are listed for a license (the admin license, the portal)
+
+    RotatedLicenseKey:
+      type: object
+      properties:
+        license_key: { type: string, description: The license's new key }
+        devices_removed: { type: integer, description: How many devices the old key had activated, now removed }
 
     Seat:
       type: object
@@ -6419,8 +6703,11 @@ components:
         license_id: { type: string, format: uuid }
         user_id: { type: string, format: uuid }
         email: { type: string }
-        role: { type: string, enum: [admin, member] }
-        invited_at: { type: string, format: date-time }
+        role: { type: string, enum: [member], description: Every seat is a member; the license owner manages the members }
+        invited_at:
+          type: string
+          format: date-time
+          description: When the invitation was last sent
         accepted_at:
           type: string
           format: date-time
@@ -6486,6 +6773,9 @@ components:
         checked_out: { type: string, format: date-time }
         expires_at: { type: string, format: date-time }
         heartbeat: { type: string, format: date-time }
+        seat_id:
+          type: string
+          description: The member whose own key checked the session out; absent for the license's key
 
     Release:
       type: object

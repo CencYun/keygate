@@ -229,8 +229,8 @@ export const portal = {
   // authed (cookie); the body's license_key only names the target
   // license — the cookie is the actual authentication.
   // Self-service device/activation management. Backend authorises the
-  // license owner OR any accepted seat (member or admin) — a teammate
-  // who lost a laptop can free their own slot without a support ticket
+  // license owner (every device) OR an accepted member (their own) — a
+  // teammate who lost a laptop can free their own slot without a support ticket
   // (internal/handler/portal_activations.go). license_key is in the
   // path; the session cookie is the actual auth.
   listActivations: (licenseKey: string) =>
@@ -240,7 +240,7 @@ export const portal = {
       `/portal/licenses/${encodeURIComponent(licenseKey)}/activations/${encodeURIComponent(activationId)}`,
     ),
   listSeats: (licenseKey: string) => post<{ seats: Seat[] }>("/portal/seats", { license_key: licenseKey }),
-  addSeat: (data: { license_key: string; email: string; role?: string }) => post<Seat>("/portal/seats/add", data),
+  addSeat: (data: { license_key: string; email: string }) => post<Seat>("/portal/seats/add", data),
   removeSeat: (data: { license_key: string; seat_id: string }) =>
     post<{ status: string }>("/portal/seats/remove", data),
   // A change to the subscription's plan or seats: previewed, then made
@@ -410,6 +410,8 @@ export const admin = {
   // The key is never in a list or detail payload — one explicit
   // request per key, audited server-side.
   revealLicenseKey: (id: string) => get<{ license_key: string }>(`/admin/licenses/${id}/key`),
+  rotateLicenseKey: (id: string) =>
+    post<{ license_key: string; devices_removed: number }>(`/admin/licenses/${id}/rotate-key`, {}),
   // Re-queues the "here is your key" mail. The address is the one on
   // the licence; the server does not accept one from here.
   resendLicenseEmail: (id: string) =>
@@ -478,7 +480,18 @@ export const admin = {
     post(`/admin/licenses/${id}/usage/reset`, data),
 
   getLicenseSeats: (id: string, params?: { limit?: number; offset?: number }) =>
-    get<Paged<{ seats: Seat[]; active_count: number }>>(`/admin/licenses/${id}/seats?${listQuery(params)}`),
+    get<Paged<{ seats: AdminSeat[]; active_count: number }>>(`/admin/licenses/${id}/seats?${listQuery(params)}`),
+  // A member's own key: revealed one at a time and audited, reissued, or
+  // the seat removed (an invitation cancelled), as the owner would.
+  revealMemberKey: (licenseId: string, seatId: string) =>
+    get<{ license_key: string }>(`/admin/licenses/${licenseId}/seats/${seatId}/key`),
+  rotateMemberKey: (licenseId: string, seatId: string) =>
+    post<{ license_key: string; devices_removed: number }>(
+      `/admin/licenses/${licenseId}/seats/${seatId}/rotate-key`,
+      {},
+    ),
+  removeLicenseSeat: (licenseId: string, seatId: string) =>
+    del<{ status: string }>(`/admin/licenses/${licenseId}/seats/${seatId}`),
 
   getAnalytics: (params?: { product_id?: string; from?: string; to?: string; granularity?: string }) => {
     const q = new URLSearchParams()
@@ -602,9 +615,15 @@ export const admin = {
   },
 
   getUserDetail: (id: string) =>
-    get<UserDetail & { license_key_hints: Record<string, string>; license_key_prefixes: Record<string, string> }>(
-      `/admin/users/${id}`,
-    ),
+    get<
+      UserDetail & {
+        license_key_hints: Record<string, string>
+        license_key_prefixes: Record<string, string>
+        // By seat ID: a membership's own key.
+        member_key_hints: Record<string, string>
+        member_key_prefixes: Record<string, string>
+      }
+    >(`/admin/users/${id}`),
 
   // Settings
   getSettings: () =>
@@ -850,6 +869,10 @@ export interface Activation {
   ip_address?: string
   last_verified: string
   created_at: string
+  // The member whose own key activated the device; absent for the
+  // owner's key.
+  seat_id?: string
+  member_email?: string
 }
 
 export interface APIKey {
@@ -895,9 +918,18 @@ export interface Seat {
   role: string
   user_id?: string
   invited_at: string
+  invite_expires_at?: string
   accepted_at?: string
   removed_at?: string
   created_at: string
+}
+
+// A seat as the admin's seat list gives it: the member's own key by its
+// prefix and last four characters, absent until they have one.
+export interface AdminSeat extends Seat {
+  key_prefix?: string
+  key_hint?: string
+  device_count: number
 }
 
 export interface UsageEvent {
@@ -1134,6 +1166,8 @@ export interface Invoice {
 export interface UserDetail {
   user: User
   licenses: License[]
+  // Seats the customer holds on other people's licences, each with it.
+  memberships: (Seat & { license?: License })[]
   subscriptions: Subscription[]
   total_usage: number
   active_seats: number
