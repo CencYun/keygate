@@ -1349,6 +1349,12 @@ type LicenseListFilter struct {
 	Limit int
 }
 
+// escapeLike makes a search term match literally in LIKE / ILIKE ...
+// ESCAPE '\': its %, _ and \ stand for themselves.
+func escapeLike(term string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(term)
+}
+
 func (s *Store) ListLicenses(ctx context.Context, f LicenseListFilter) ([]*model.License, int, error) {
 	sort := f.Sort
 	if sort.Expr == "" {
@@ -1369,13 +1375,17 @@ func (s *Store) ListLicenses(ctx context.Context, f LicenseListFilter) ([]*model
 	if f.ExternalWorkspaceID != "" {
 		q = q.Where("license.external_workspace_id = ?", f.ExternalWorkspaceID)
 	}
-	if f.Search != "" {
-		// Only search by email and key prefix — never expose full key via wildcard search.
-		// A member's address or own key finds the licence they are on,
-		// as the owner's do.
-		q = q.Where(`(license.email ILIKE ? OR license.license_key LIKE ? OR EXISTS (SELECT 1 FROM seats s
-			WHERE s.license_id = license.id AND s.removed_at IS NULL AND (s.email ILIKE ? OR s.member_key LIKE ?)))`,
-			"%"+f.Search+"%", f.Search+"%", "%"+f.Search+"%", f.Search+"%")
+	if search := strings.TrimSpace(f.Search); search != "" {
+		// An address matches in part, literally (% and _ are not
+		// wildcards); a key only whole, by its hash, the licence's or a
+		// member's. A match on part of a key would let a search guess
+		// one a character at a time, around the audited reveal.
+		term := "%" + escapeLike(search) + "%"
+		hash := license.HashKey(search)
+		q = q.Where(`(license.email ILIKE ? ESCAPE '\' OR license.key_hash = ?
+			OR EXISTS (SELECT 1 FROM seats s WHERE s.license_id = license.id AND s.removed_at IS NULL
+				AND (s.email ILIKE ? ESCAPE '\' OR s.member_key_hash = ?)))`,
+			term, hash, term, hash)
 	}
 	total, err := q.Count(ctx)
 	if err != nil {
@@ -1696,6 +1706,30 @@ func (s *Store) StripeReadStamp(ctx context.Context) (time.Time, error) {
 // the final state.
 func (s *Store) SetSubscriptionCancelScheduled(ctx context.Context, licenseID string, scheduled bool, asOf time.Time) error {
 	return s.setCancelState(ctx, licenseID, scheduled, asOf, false)
+}
+
+// CancelScheduledLicenses reports which of the licences have a
+// subscription set to end at its period end rather than renew, as last
+// recorded from Stripe (SetSubscriptionCancelScheduled).
+func (s *Store) CancelScheduledLicenses(ctx context.Context, licenseIDs []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(licenseIDs))
+	if len(licenseIDs) == 0 {
+		return out, nil
+	}
+	// As the reminders read it (cancelStateSQL): the newest recorded
+	// state, for a licence a Stripe subscription still bills and that
+	// is still running. One unlinked or ended has nothing left to end.
+	var ids []string
+	if err := s.DB.NewRaw(`SELECT license.id FROM licenses license
+		WHERE license.id IN (?) AND COALESCE(license.stripe_subscription_id, '') <> ''
+			AND license.status IN (?) AND `+cancelStateSQL+` IS TRUE`,
+		bun.In(licenseIDs), bun.In([]string{model.StatusActive, model.StatusTrialing, model.StatusPastDue})).Scan(ctx, &ids); err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out, nil
 }
 
 // RecordSubscriptionCancelStateIfUnknown records the state only while

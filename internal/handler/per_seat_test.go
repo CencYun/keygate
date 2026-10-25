@@ -142,6 +142,44 @@ func TestSetLicenseQuantity(t *testing.T) {
 	if d, _ := out["data"].(map[string]any); code != http.StatusOK || d["seat_limit"] != float64(4) || d["activation_limit"] != float64(12) {
 		t.Fatalf("detail = %d %v, want the limits", code, out)
 	}
+	// Outside what the plan sells, 1 to 50, as a checkout would refuse.
+	if code, out := set(`{"quantity":51}`); code != http.StatusConflict || errCode(out) != "QUANTITY_OUT_OF_RANGE" {
+		t.Fatalf("set 51 on a 1 to 50 plan = %d %v, want 409 QUANTITY_OUT_OF_RANGE, as the portal answers", code, out)
+	}
+	// Not below what is in use: two people (the owner and a member) and
+	// seven devices, on four seats of three devices each.
+	member := &model.Seat{LicenseID: lic.ID, Email: "q-member-" + f.suffix + "@example.com", Role: "member"}
+	if _, _, err := f.s.AddSeatWithinLimit(f.ctx, member, 0); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := set(`{"quantity":1}`); code != http.StatusConflict || errCode(out) != "SEATS_IN_USE" {
+		t.Fatalf("set 1 with two people = %d %v, want 409 SEATS_IN_USE", code, out)
+	}
+	for i := range 7 {
+		if err := f.s.ActivateWithinLimit(f.ctx, &model.Activation{LicenseID: lic.ID, Identifier: fmt.Sprintf("q-pc%d", i),
+			IdentifierType: "device"}, 12); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, out = set(`{"quantity":2}`)
+	e, _ := out["error"].(map[string]any)
+	det, _ := e["details"].(map[string]any)
+	if code != http.StatusConflict || errCode(out) != "DEVICES_IN_USE" || det["in_use"] != float64(7) || det["activation_limit"] != float64(6) {
+		t.Fatalf("set 2 with seven devices = %d %v, want 409 DEVICES_IN_USE, 7 in use, a limit of 6", code, out)
+	}
+	if got, _ := f.s.FindLicenseByID(f.ctx, lic.ID); got.Quantity != 4 {
+		t.Fatalf("a refused change moved the seats to %d", got.Quantity)
+	}
+	// Once the room is freed it goes ahead; raising is never refused.
+	if _, err := f.s.DB.NewRaw("DELETE FROM activations WHERE license_id = ? AND identifier = 'q-pc6'", lic.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := set(`{"quantity":2}`); code != http.StatusOK {
+		t.Fatalf("set 2 with two people and six devices = %d %v", code, out)
+	}
+	if code, out := set(`{"quantity":4}`); code != http.StatusOK {
+		t.Fatalf("raise back to 4 = %d %v", code, out)
+	}
 	if _, err := f.s.DB.NewRaw("UPDATE licenses SET stripe_subscription_id = ? WHERE id = ?", "sub_q_"+f.suffix, lic.ID).Exec(f.ctx); err != nil {
 		t.Fatal(err)
 	}

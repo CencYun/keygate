@@ -1180,3 +1180,71 @@ func TestRotateMemberKey(t *testing.T) {
 		t.Fatalf("reissue for no seat = %v, want sql.ErrNoRows", err)
 	}
 }
+
+// The portal tells an owner their subscription is set to end: the
+// licences whose subscription is recorded as ending at the period end.
+func TestCancelScheduledLicenses(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	_, _, ending := perSeatLicense(t, s, ctx, 5, false)
+	_, _, renewing := perSeatLicense(t, s, ctx, 5, false)
+	_, _, unlinked := perSeatLicense(t, s, ctx, 5, false)
+	_, _, ended := perSeatLicense(t, s, ctx, 5, false)
+	for _, l := range []*model.License{ending, renewing, unlinked, ended} {
+		if _, err := s.DB.NewRaw("UPDATE licenses SET payment_provider = 'stripe', stripe_subscription_id = ? WHERE id = ?",
+			"sub_cs_"+l.ID, l.ID).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetSubscriptionCancelScheduled(ctx, l.ID, l != renewing, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Unlinked from Stripe by an admin, or ended: nothing left to end.
+	if _, err := s.DB.NewRaw("UPDATE licenses SET stripe_subscription_id = NULL WHERE id = ?", unlinked.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.NewRaw("UPDATE licenses SET status = 'canceled' WHERE id = ?", ended.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.CancelScheduledLicenses(ctx, []string{ending.ID, renewing.ID, unlinked.ID, ended.ID, "no-such-licence"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got[ending.ID] || len(got) != 1 {
+		t.Fatalf("cancel scheduled = %v, want only the running licence set to end", got)
+	}
+	if got, err := s.CancelScheduledLicenses(ctx, nil); err != nil || len(got) != 0 {
+		t.Fatalf("for no licences = %v, %v", got, err)
+	}
+}
+
+// A pending seat that still holds a key (an older version removed and
+// invited it back without clearing it) gives its member a new key on
+// accepting, not the one they had before.
+func TestAccept_DropsALeftoverKey(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	_, _, lic := perSeatLicense(t, s, ctx, 5, false)
+	alice := acceptedMember(t, s, ctx, lic, "alice")
+	old := memberKey(t, s, ctx, alice)
+	plain, hash := store.GenerateSeatInviteToken()
+	if _, err := s.DB.NewRaw(`UPDATE seats SET accepted_at = NULL, user_id = NULL, invite_token_hash = ?,
+		invite_expires_at = now() + interval '1 hour' WHERE id = ?`, hash, alice.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AcceptSeatInvite(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FindLicenseByKey(ctx, old); err == nil {
+		t.Fatal("the key from before opens the licence again")
+	}
+	fresh, err := s.FindSeatByID(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k := memberKey(t, s, ctx, fresh); k == "" || k == old {
+		t.Fatalf("key after accepting = %q, want a new one", k)
+	}
+}

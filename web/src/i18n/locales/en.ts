@@ -245,9 +245,13 @@ const en = {
   "licenses.removed": "Removed",
   "licenses.changePlanDesc": "Select a new plan for this license.",
   "licenses.seatsBought": "Seats bought",
+  "licenses.searchPlaceholder": "Email or whole license key",
+  "licenses.seatsUsedOf": "{used} of {max} in use",
+  "licenses.seatsUsed": "{used} in use",
   "licenses.quantitySaved": "Seats updated.",
   "licenses.quantityStripeManaged":
     "This license is billed by a Stripe subscription, so its seats change there or in the customer portal.",
+  "licenses.quantityOutOfRange": "This plan sells {min} to {max} seats.",
   "licenses.quantityNotPerSeat": "This license's plan is not sold per seat, so it has no seats bought to change.",
   "licenses.quantityStripe": "set by the Stripe subscription",
   "licenses.issueDesc": "Manually create a license for a user.",
@@ -620,8 +624,8 @@ const en = {
   "portal.noLicenses": "No licenses yet",
   "portal.noLicensesDesc": "Your licenses will appear here once purchased.",
   "portal.validFrom": "Valid From",
-  "portal.noDevices": "No active devices.",
-  "portal.activeDevices": "Active Devices",
+  "portal.noDevices": "No devices yet.",
+  "portal.devices": "Devices",
   "portal.lastVerified": "Last verified:",
   "portal.seatPending": "Invited",
   "portal.seatJoinedOn": "Joined:",
@@ -677,6 +681,11 @@ const en = {
   "portal.updatePayment": "Update Payment",
   "portal.changePlan": "Change Plan",
   "portal.cancelSubscription": "Cancel Subscription",
+  "portal.endNowTitle": "End this subscription now?",
+  "portal.endNowDesc": "Your {product} subscription is already set to end. Ending it now stops it at once instead.",
+  "portal.endNow": "End now",
+  "portal.cancelledNow": "Subscription ended.",
+  "portal.cancelledAtPeriodEnd": "Subscription set to end at the end of the period.",
   "portal.cancelDesc": "Are you sure you want to cancel your {product} subscription?",
   "portal.cancelImmediately": "Cancel immediately (lose access now)",
   "portal.cancelImmediateWarning": "Your access will end immediately. This cannot be undone.",
@@ -728,7 +737,6 @@ const en = {
   "portal.inviteSeatLimit": "All seats on this license are taken, so nobody else can be invited right now.",
   "portal.downgradeNotSupported":
     "This change lowers one limit while raising another, costs more, or bills on a different schedule, so it can't be made here. Please contact the seller.",
-  "portal.amountsNextInvoice": "Amounts are from Stripe and include tax and discounts, if any.",
   "portal.downgradeNextInvoice": "Your next invoice, on {date}, is {amount}.",
   "portal.downgradeNoRefund": "The rest of this billing period is not refunded.",
   "portal.pendingNoLink": "Payment for this change is still due. The invoice was sent to your email.",
@@ -751,18 +759,19 @@ const en = {
   "portal.changeNotYet": "Your subscription stays as it is until the payment goes through.",
   "portal.payNow": "Pay now",
   "portal.payLater": "Later",
+  "portal.endsOn": "This subscription ends on {date} and will not renew.",
   "portal.pendingChange":
     "A change to your subscription is waiting for payment until {date}. Unpaid by then, it is dropped and nothing is charged.",
   "portal.pendingGone": "That change is no longer waiting for payment.",
   "portal.changeSeatsInUse":
-    "{people} people are on this license. Remove members until there are {seats} or fewer, then lower the seats.",
+    "{people} people are on or invited to this license. Remove members or cancel invitations until there are no more than {seats}, then lower the seats.",
   "portal.changeQuantityRange": "This plan is sold in {min} to {max} seats.",
   "portal.changeStale": "Your subscription changed since this price was shown. Review it again before confirming.",
   "portal.changeExpired": "This price was shown over an hour ago. Review it again before confirming.",
   "portal.changeInProgress": "Another change to this subscription is being confirmed. Try again in a moment.",
   "portal.owedIncluded": "Includes {owed} already owed on your account.",
   "portal.upgradeTooManyPeople":
-    "{people} people are on this license, more than this plan's {max} seats. Remove members first, or choose another plan.",
+    "{people} people are on or invited to this license, more than this plan's {max} seats. Remove members or cancel invitations first, or choose another plan.",
   "portal.changePaymentMethodUnsupported":
     "This subscription's payment method can't hold a change until it is paid. Switch to a card with Update Payment, or contact the seller.",
   "portal.changeSessionsInUse":
@@ -770,11 +779,11 @@ const en = {
   "portal.changeTooFast": "Busy right now. Wait a moment and try again.",
   "portal.changeUnavailable": "Payments aren't available right now. Please contact the seller.",
   "portal.changeDevicesInUse":
-    "{inUse} devices are in use on this license. Remove devices until there are {limit} or fewer, then lower the seats.",
+    "{inUse} devices are in use on this license. Remove devices until there are no more than {limit}, then lower the seats.",
   "portal.changePlanDevicesInUse":
     "{inUse} devices are in use on this license, more than the {limit} after the change. Remove devices first, or choose more seats.",
   "portal.changePlanTooManyPeople":
-    "{people} people are on this license, more than the {seats} this plan holds. Remove members first.",
+    "{people} people are on or invited to this license, more than the {seats} this plan holds. Remove members or cancel invitations first.",
   "portal.changeRefused":
     "Stripe couldn't make this change. Check your payment method, choose another plan, or contact the seller.",
   "portal.changePaymentTitle": "Payment needed",
@@ -785,7 +794,7 @@ const en = {
   "portal.peopleInUseNow": "In use now: {people} people.",
   "portal.sessionsCount": "Sessions at once: {count}",
   "portal.changePlanSeatsInUse":
-    "{people} people are on this license, more than the {seats} seats chosen. Choose more seats if the plan sells them, or remove members first.",
+    "{people} people are on or invited to this license, more than the {seats} seats chosen. Choose more seats if the plan sells them, or remove members or cancel invitations first.",
   "portal.seatLimitFull": "All seats are in use. Contact the seller to add seats.",
   "portal.changeNotActive": "This subscription can be changed once it's active again. Settle any open payment first.",
   "portal.changeNotSupported": "This subscription can't be changed here. Please contact the seller.",

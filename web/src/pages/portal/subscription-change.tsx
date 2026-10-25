@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Minus, Plus } from "lucide-react"
 import { useEffect, useState } from "react"
 import { showToast } from "@/components/toast"
@@ -152,13 +152,15 @@ export function SubscriptionChangeDialog({
       portal.changeSubscription({ license_id: license.id, preview_token: p.preview_token }),
     meta: { ownErrors: true },
     onSuccess: (res) => {
-      qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
+      // The plan or the seats moved, and with them the team's and the
+      // devices' limits: everything the portal shows is read again.
+      qc.invalidateQueries({ queryKey: ["portal"] })
       if (res.status === "processing") {
         // Stripe's event usually follows within seconds: the licence is
         // read again then, so "it will show here shortly" holds without a
         // reload, closed dialog or not.
         for (const ms of [5000, 15000]) {
-          setTimeout(() => qc.invalidateQueries({ queryKey: ["portal", "licenses"] }), ms)
+          setTimeout(() => qc.invalidateQueries({ queryKey: ["portal"] }), ms)
         }
       }
       if (res.status === "applied") {
@@ -200,12 +202,12 @@ export function SubscriptionChangeDialog({
   useEffect(() => {
     const cur = preview.data?.current
     if (cur && (cur.quantity !== (license.quantity ?? 1) || cur.plan_id !== license.plan_id)) {
-      qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
+      refreshBehindPreview(qc)
     }
   }, [preview.data, license.quantity, license.plan_id, qc])
   useEffect(() => {
     for (const err of [preview.error, changeMut.error]) {
-      if (err && staleCodes.includes(errorCode(err) ?? "")) qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
+      if (err && staleCodes.includes(errorCode(err) ?? "")) refreshBehindPreview(qc)
     }
   }, [preview.error, changeMut.error, qc])
   const errorText = (err: unknown) => {
@@ -430,7 +432,7 @@ export function SubscriptionChangeDialog({
               onClose={onClose}
               onPaying={() => {
                 // Back from Stripe's tab, the portal reads the licence again.
-                qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
+                qc.invalidateQueries({ queryKey: ["portal"] })
                 onClose()
               }}
             />
@@ -461,6 +463,14 @@ function limitsText(
 
 // staleCodes are refusals that mean the licence shown is out of date.
 const staleCodes = ["NO_CHANGE", "SUBSCRIPTION_CHANGED", "CHANGE_IN_PROGRESS"]
+
+// refreshBehindPreview reads again what the portal shows behind an open
+// preview: the licence, its team and its devices, but not the preview
+// itself. These refreshes follow from the preview's own answer; reading
+// it again would answer again, each time a new object, and loop.
+function refreshBehindPreview(qc: QueryClient) {
+  qc.invalidateQueries({ queryKey: ["portal"], predicate: (q) => q.queryKey[1] !== "change-preview" })
+}
 
 // dropsPending reports a "change" to the terms the subscription has
 // already: all it does is drop the change waiting for payment.
@@ -547,9 +557,7 @@ function PreviewSummary({
       {p.replaces_pending && <p className="text-muted-foreground">{t("portal.replacesPending")}</p>}
       {/* A downgrade of a subscription set to end shows no amount. */}
       {(!p.downgrade || p.next_invoice_at) && (
-        <p className="text-xs text-muted-foreground">
-          {t(p.downgrade ? "portal.amountsNextInvoice" : "portal.amountsByStripe")}
-        </p>
+        <p className="text-xs text-muted-foreground">{t("portal.amountsByStripe")}</p>
       )}
     </div>
   )
@@ -638,7 +646,7 @@ export function PendingChangeNotice({ license }: { license: PortalLicense }) {
     } finally {
       setOpening(false)
       // Paid, dropped or still waiting: the server read Stripe just now.
-      qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
+      qc.invalidateQueries({ queryKey: ["portal"] })
     }
   }
   return (

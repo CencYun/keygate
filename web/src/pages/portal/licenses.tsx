@@ -225,7 +225,7 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
           {/* The count and cap are the team's: a member is told so, as
               the list below holds only their own devices. */}
           <div>
-            <p className="text-muted-foreground">{t(isOwner ? "licenses.activations" : "portal.teamDevices")}</p>
+            <p className="text-muted-foreground">{t(isOwner ? "portal.devices" : "portal.teamDevices")}</p>
             <p className="font-medium">
               {lic.activation_count ?? lic.activations?.length ?? 0} / {activationCap || "-"}
             </p>
@@ -251,6 +251,15 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
         </div>
 
         {isOwner && <PendingChangeNotice license={lic} />}
+        {/* Set to end: it runs to the date it is paid to, then stops. */}
+        {isOwner &&
+          lic.cancel_scheduled &&
+          lic.valid_until &&
+          ["active", "trialing", "past_due"].includes(lic.status) && (
+            <p className="rounded-lg border px-3 py-2 text-sm text-muted-foreground">
+              {t("portal.endsOn").replace("{date}", formatDate(lic.valid_until))}
+            </p>
+          )}
 
         {/* Maintenance period */}
         {isPerpetualPlan && (
@@ -317,7 +326,7 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
         {/* Tabs for detailed sections */}
         <Tabs value={activeTab} onValueChange={setTab}>
           <TabsList>
-            <TabsTrigger value="overview">{t("licenses.activations")}</TabsTrigger>
+            <TabsTrigger value="overview">{t("portal.devices")}</TabsTrigger>
             <TabsTrigger value="entitlements">{t("plans.entitlements")}</TabsTrigger>
             {showUsage && <TabsTrigger value="usage">{t("analytics.usage")}</TabsTrigger>}
             {showSeats && <TabsTrigger value="seats">{t("portal.teamMembers")}</TabsTrigger>}
@@ -357,6 +366,7 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
             licenseId={lic.id}
             provider={lic.payment_provider || ""}
             productName={lic.product?.name || ""}
+            scheduled={!!lic.cancel_scheduled}
             onClose={() => setShowCancel(false)}
           />
         )}
@@ -438,7 +448,7 @@ function ActivationsSection({ license }: { license: PortalLicense }) {
         <p className="text-sm font-medium">
           {ownOnly
             ? `${t("portal.myDevices")} (${embedded.length})`
-            : `${t("portal.activeDevices")} (${embedded.length}${
+            : `${t("portal.devices")} (${embedded.length}${
                 (license.activation_limit ?? license.plan?.max_activations)
                   ? `/${license.activation_limit ?? license.plan?.max_activations}`
                   : ""
@@ -470,7 +480,10 @@ function ActivationsSection({ license }: { license: PortalLicense }) {
   }
 
   const activations = actQuery.data?.activations || []
-  const max = actQuery.data?.max ?? 0
+  // The licence's limit, as the card shows it: read again with the
+  // licence (on focus too), so a change paid in Stripe's tab shows here
+  // as on the card.
+  const max = license.activation_limit ?? actQuery.data?.max ?? 0
 
   return (
     <div className="space-y-3">
@@ -478,7 +491,7 @@ function ActivationsSection({ license }: { license: PortalLicense }) {
         <p className="text-sm font-medium">
           {ownOnly
             ? `${t("portal.myDevices")} (${activations.length})`
-            : `${t("portal.activeDevices")} (${activations.length}${max > 0 ? `/${max}` : ""})`}
+            : `${t("portal.devices")} (${activations.length}${max > 0 ? `/${max}` : ""})`}
         </p>
       </div>
 
@@ -632,6 +645,8 @@ function SeatsSection({ license, onAddSeats }: { license: PortalLicense; onAddSe
   const removeMut = useMutation({
     mutationFn: (seatId: string) => portal.removeSeat({ license_key: license.license_key, seat_id: seatId }),
     meta: { ownErrors: true },
+    onSuccess: () =>
+      showToast(t(removing?.accepted_at ? "licenses.memberRemoved" : "licenses.inviteCancelled"), "success"),
     onError: (e: Error) => showToast(changedElsewhere(e) ? t("portal.changedElsewhere") : e.message, "error"),
     // Read the team again either way. The license list carries the
     // seats that decide whether the team tab shows at all, and the
@@ -1053,16 +1068,19 @@ function CancelDialog({
   licenseId,
   provider,
   productName,
+  scheduled,
   onClose,
 }: {
   licenseId: string
+  // Already set to end at the period end: what is left is to end it now.
+  scheduled: boolean
   provider: string
   productName: string
   onClose: () => void
 }) {
   const { t } = useI18n()
   const qc = useQueryClient()
-  const [immediate, setImmediate] = useState(false)
+  const [immediate, setImmediate] = useState(scheduled)
 
   const cancelMut = useMutation({
     mutationFn: () => {
@@ -1070,6 +1088,7 @@ function CancelDialog({
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
+      showToast(t(immediate ? "portal.cancelledNow" : "portal.cancelledAtPeriodEnd"), "success")
       onClose()
     },
     onError: (e: Error) => showToast(e.message, "error"),
@@ -1079,12 +1098,16 @@ function CancelDialog({
     <Dialog open onOpenChange={onClose}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{t("portal.cancelSubscription")}</DialogTitle>
-          <DialogDescription>{t("portal.cancelDesc", { product: productName })}</DialogDescription>
+          <DialogTitle>{t(scheduled ? "portal.endNowTitle" : "portal.cancelSubscription")}</DialogTitle>
+          <DialogDescription>
+            {scheduled
+              ? t("portal.endNowDesc", { product: productName })
+              : t("portal.cancelDesc", { product: productName })}
+          </DialogDescription>
         </DialogHeader>
         <DialogBody>
           <div className="space-y-4">
-            {provider === "stripe" && (
+            {provider === "stripe" && !scheduled && (
               <label className="flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
@@ -1103,7 +1126,7 @@ function CancelDialog({
                 {t("common.cancel")}
               </Button>
               <Button variant="destructive" onClick={() => cancelMut.mutate()} disabled={cancelMut.isPending}>
-                {cancelMut.isPending ? t("common.loading") : t("portal.confirmCancel")}
+                {cancelMut.isPending ? t("common.loading") : t(scheduled ? "portal.endNow" : "portal.confirmCancel")}
               </Button>
             </div>
           </div>
@@ -1172,6 +1195,23 @@ function InvoicesDialog({ licenseId, onClose }: { licenseId: string; onClose: ()
   )
 }
 
+// planKind is a plan's type and billing period in the reader's language.
+function planKind(t: ReturnType<typeof useI18n>["t"], plan: Plan): string {
+  const types: Record<string, TranslationKeys> = {
+    subscription: "plans.subscription",
+    perpetual: "plans.perpetual",
+    trial: "plans.trial",
+  }
+  const intervals: Record<string, TranslationKeys> = { month: "plans.monthly", year: "plans.yearly" }
+  const type = types[plan.license_type] ? t(types[plan.license_type]) : plan.license_type
+  const interval = plan.billing_interval
+    ? intervals[plan.billing_interval]
+      ? t(intervals[plan.billing_interval])
+      : plan.billing_interval
+    : ""
+  return interval ? `${type} · ${interval}` : type
+}
+
 // UpgradeDialog lists the product's paid plans for a licence nothing is
 // billing yet. Picking one goes to Stripe checkout; once paid, the same
 // licence moves to that plan.
@@ -1229,8 +1269,7 @@ function UpgradeDialog({ license, onClose }: { license: PortalLicense; onClose: 
                   <div>
                     <p className="font-medium text-sm">{plan.name}</p>
                     <p className="text-xs text-muted-foreground">
-                      {plan.license_type}
-                      {plan.billing_interval ? ` · ${plan.billing_interval}` : ""}
+                      {planKind(t, plan)}
                       {plan.per_seat ? ` · ${t("portal.perSeatChooseAtCheckout")}` : ""}
                     </p>
                   </div>
@@ -1303,8 +1342,7 @@ function ChangePlanDialog({ license, onClose }: { license: PortalLicense; onClos
                       )}
                     </p>
                     <p className="text-xs text-muted-foreground">
-                      {plan.license_type}
-                      {plan.billing_interval ? ` · ${plan.billing_interval}` : ""}
+                      {planKind(t, plan)}
                       {plan.per_seat ? ` · ${t("portal.perSeat")}` : ""}
                     </p>
                   </div>

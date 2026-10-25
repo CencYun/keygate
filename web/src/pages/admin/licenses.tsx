@@ -63,7 +63,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { type TranslationKeys, useI18n } from "@/i18n"
-import { type AdminSeat, admin, errorCode, type License, type Plan } from "@/lib/api"
+import { type AdminSeat, admin, errorCode, errorDetails, type License, type Plan } from "@/lib/api"
 import { formatDate, maskKey, statusColor } from "@/lib/utils"
 
 // A date picked in the expiry field means "valid through that whole
@@ -174,7 +174,7 @@ export default function LicensesPage() {
         <div className="relative w-full sm:w-auto sm:flex-1 sm:max-w-sm">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input
-            placeholder={t("common.search")}
+            placeholder={t("licenses.searchPlaceholder")}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="pl-9"
@@ -1437,8 +1437,11 @@ function SeatsTab({
   return (
     <div className="space-y-4 pt-2">
       <h3 className="font-semibold">
-        {t("licenses.seats")} ({activeCount}
-        {maxSeats > 0 ? ` / ${maxSeats}` : ""} {t("licenses.active")})
+        {t("licenses.seats")} (
+        {maxSeats > 0
+          ? t("licenses.seatsUsedOf").replace("{used}", String(activeCount)).replace("{max}", String(maxSeats))
+          : t("licenses.seatsUsed").replace("{used}", String(activeCount))}
+        )
       </h3>
       {hasSeats && <p className="text-xs text-muted-foreground">{t("licenses.seatsIncludeOwner")}</p>}
       {seats.length === 0 ? (
@@ -1695,7 +1698,10 @@ function QuantityField({ license }: { license: License }) {
   const [editing, setEditing] = useState(false)
   const [value, setValue] = useState(String(license.quantity ?? 1))
   const n = Number(value)
-  const valid = Number.isInteger(n) && n >= 1 && n <= 10000
+  // What the plan sells, as a checkout or the portal would allow.
+  const min = license.plan?.min_quantity ?? 1
+  const max = license.plan?.max_quantity ?? 10000
+  const valid = Number.isInteger(n) && n >= min && n <= max
   const saveMut = useMutation({
     mutationFn: () => admin.setLicenseQuantity(license.id, n),
     onSuccess: () => {
@@ -1712,12 +1718,27 @@ function QuantityField({ license }: { license: License }) {
         qc.invalidateQueries({ queryKey: ["admin", "license", license.id] })
         setEditing(false)
       }
+      // Below what the licence uses: the same refusal the portal gives
+      // its owner, who frees the room first.
+      const d = errorDetails(e) ?? {}
       showToast(
         errorCode(e) === "STRIPE_MANAGED"
           ? t("licenses.quantityStripeManaged")
           : errorCode(e) === "NOT_PER_SEAT"
             ? t("licenses.quantityNotPerSeat")
-            : e.message,
+            : errorCode(e) === "QUANTITY_OUT_OF_RANGE"
+              ? t("licenses.quantityOutOfRange")
+                  .replace("{min}", String(d.min ?? min))
+                  .replace("{max}", String(d.max ?? max))
+              : errorCode(e) === "SEATS_IN_USE"
+                ? t("portal.changeSeatsInUse")
+                    .replace("{people}", String(d.in_use ?? ""))
+                    .replace("{seats}", String(d.seat_limit ?? n))
+                : errorCode(e) === "DEVICES_IN_USE"
+                  ? t(d.kind === "sessions" ? "portal.changeSessionsInUse" : "portal.changeDevicesInUse")
+                      .replace("{inUse}", String(d.in_use ?? ""))
+                      .replace("{limit}", String(d.activation_limit ?? ""))
+                  : e.message,
         "error",
       )
     },
@@ -1727,11 +1748,11 @@ function QuantityField({ license }: { license: License }) {
     <div>
       <p className="text-muted-foreground">{t("licenses.seatsBought")}</p>
       {editing ? (
-        <div className="mt-1 flex items-center gap-2">
+        <div className="mt-1 flex flex-wrap items-center gap-2">
           <Input
             type="number"
-            min={1}
-            max={10000}
+            min={min}
+            max={max}
             className="h-8 w-24"
             aria-label={t("licenses.seatsBought")}
             value={value}
@@ -1747,6 +1768,10 @@ function QuantityField({ license }: { license: License }) {
           <Button size="sm" variant="ghost" className="h-8" onClick={() => setEditing(false)}>
             {t("common.cancel")}
           </Button>
+          {/* Why Save may be off: the plan's range. */}
+          <p className={`basis-full text-xs ${valid ? "text-muted-foreground" : "text-destructive"}`}>
+            {t("licenses.quantityOutOfRange").replace("{min}", String(min)).replace("{max}", String(max))}
+          </p>
         </div>
       ) : (
         <div className="mt-1 flex items-center gap-2">

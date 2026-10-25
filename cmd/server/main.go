@@ -909,9 +909,21 @@ func main() {
 				// Upgradable says the owner can upgrade it to a paid
 				// plan now (see StripeHandler.UpgradableLicenses).
 				Upgradable bool `json:"upgradable"`
+				// CancelScheduled says its subscription ends at the
+				// period end rather than renews; told to the owner.
+				CancelScheduled bool `json:"cancel_scheduled,omitempty"`
 			}
 			model.FillLimits(licenses...)
 			upgradable, err := stripeH.UpgradableLicenses(c, emailStr, licenses)
+			if err != nil {
+				response.Internal(c, err)
+				return
+			}
+			ids := make([]string, len(licenses))
+			for i, l := range licenses {
+				ids[i] = l.ID
+			}
+			ending, err := db.CancelScheduledLicenses(c, ids)
 			if err != nil {
 				response.Internal(c, err)
 				return
@@ -926,7 +938,8 @@ func main() {
 				if !ok {
 					continue
 				}
-				out = append(out, portalLicense{License: l, LicenseKey: key, Upgradable: upgradable[l.ID]})
+				out = append(out, portalLicense{License: l, LicenseKey: key, Upgradable: upgradable[l.ID],
+					CancelScheduled: ending[l.ID] && strings.EqualFold(l.Email, emailStr)})
 			}
 			// The portal hides the renewal button while the switch is
 			// off; the endpoint refuses the sale regardless.

@@ -314,6 +314,97 @@ func (s *Store) RotateMemberKey(ctx context.Context, seatID string) (string, []*
 	return key, removed, tx.Commit()
 }
 
+// SeatLeftover is a removed seat that still holds what a removal clears.
+type SeatLeftover struct {
+	ID        string `bun:"id"`
+	LicenseID string `bun:"license_id"`
+	ProductID string `bun:"product_id"`
+	Email     string `bun:"email"`
+}
+
+// FindSeatLeftovers returns up to limit seats not on the team, removed
+// or invited and not yet accepted, that still hold a key, devices or
+// floating sessions. This version never leaves any on such a seat
+// (RemoveSeat clears them, and only an accepted member gets a key), so
+// only what an older version left during a rolling upgrade is found: a
+// member it removed (it set removed_at alone), or removed and invited
+// back.
+func (s *Store) FindSeatLeftovers(ctx context.Context, limit int) ([]SeatLeftover, error) {
+	var out []SeatLeftover
+	err := s.DB.NewRaw(`SELECT s.id, s.license_id, l.product_id, s.email FROM seats s
+		JOIN licenses l ON l.id = s.license_id
+		WHERE (s.removed_at IS NOT NULL OR s.accepted_at IS NULL) AND (s.member_key_hash IS NOT NULL
+			OR EXISTS (SELECT 1 FROM activations a WHERE a.seat_id = s.id)
+			OR EXISTS (SELECT 1 FROM floating_sessions f WHERE f.seat_id = s.id))
+		ORDER BY s.created_at LIMIT ?`, limit).Scan(ctx, &out)
+	return out, err
+}
+
+// ClearSeatLeftovers finishes a removal an older version left undone: the
+// seat's key is cleared and its devices and floating sessions removed,
+// under the licence row lock as RemoveSeat does. Only while the seat is
+// still not on the team (removed, or pending): one accepted meanwhile is
+// left alone. It returns the devices removed, and whether anything was
+// done.
+func (s *Store) ClearSeatLeftovers(ctx context.Context, seatID string) ([]*model.Activation, bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var licenseID string
+	if err := tx.NewRaw("SELECT license_id FROM seats WHERE id = ?", seatID).Scan(ctx, &licenseID); err != nil {
+		return nil, false, err
+	}
+	if err := lockLicenseIn(ctx, tx, licenseID); err != nil {
+		return nil, false, err
+	}
+	var state struct {
+		OffTeam bool `bun:"off_team"`
+		HasKey  bool `bun:"has_key"`
+	}
+	if err := tx.NewRaw(`SELECT removed_at IS NOT NULL OR accepted_at IS NULL AS off_team, member_key_hash IS NOT NULL AS has_key
+		FROM seats WHERE id = ? FOR UPDATE`, seatID).Scan(ctx, &state); err != nil {
+		return nil, false, err
+	}
+	if !state.OffTeam {
+		return nil, false, nil
+	}
+	if _, err := tx.NewUpdate().Model((*model.Seat)(nil)).
+		Set("member_key = NULL").
+		Set("member_key_hash = NULL").
+		Set("member_key_encrypted = NULL").
+		Where("id = ?", seatID).Exec(ctx); err != nil {
+		return nil, false, err
+	}
+	var devices []*model.Activation
+	if err := tx.NewRaw("DELETE FROM activations WHERE seat_id = ? RETURNING *", seatID).Scan(ctx, &devices); err != nil {
+		return nil, false, err
+	}
+	res, err := tx.NewRaw("DELETE FROM floating_sessions WHERE seat_id = ?", seatID).Exec(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	sessions, _ := res.RowsAffected()
+	// Done only when something was left: a second sweep (another
+	// replica's, say) that finds it cleared reports nothing.
+	return devices, state.HasKey || len(devices) > 0 || sessions > 0, tx.Commit()
+}
+
+// NormalizeSeatRoles turns any seat with the admin role into a member:
+// the role is gone (20261028_member_keys), but an older version still
+// running during a rolling upgrade may have written one since. It
+// returns how many it changed.
+func (s *Store) NormalizeSeatRoles(ctx context.Context) (int, error) {
+	res, err := s.DB.NewRaw("UPDATE seats SET role = 'member' WHERE role <> 'member'").Exec(ctx)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
 // FillMemberEmails sets MemberEmail on the devices members' keys
 // activated, so a list of devices says whose each is.
 func (s *Store) FillMemberEmails(ctx context.Context, rows []*model.Activation) error {

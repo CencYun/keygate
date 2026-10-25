@@ -1674,11 +1674,7 @@ func TestSeats_DowngradeAnnouncedOnce(t *testing.T) {
 		t.Fatal(c)
 	}
 	f.subscriptionUpdated() // Stripe's event for it
-	var n int
-	time.Sleep(200 * time.Millisecond) // audit entries are written in the background
-	if err := f.s.DB.NewRaw("SELECT COUNT(*) FROM audit_logs WHERE entity_id = ? AND action = 'quantity_changed'", f.lic.ID).Scan(f.ctx, &n); err != nil {
-		t.Fatal(err)
-	}
+	n := f.quantityChanges(1)
 	if n != 1 {
 		t.Fatalf("quantity_changed recorded %d times, want 1", n)
 	}
@@ -1748,11 +1744,7 @@ func TestSeats_ReadDuringADowngradeKeepsTheLowerSeats(t *testing.T) {
 				t.Fatalf("%d invites got in during a downgrade to 2 seats, want 1", got)
 			}
 			f.subscriptionUpdated() // Stripe's event for the downgrade
-			var n int
-			time.Sleep(200 * time.Millisecond) // audit entries are written in the background
-			if err := f.s.DB.NewRaw("SELECT COUNT(*) FROM audit_logs WHERE entity_id = ? AND action = 'quantity_changed'", f.lic.ID).Scan(f.ctx, &n); err != nil {
-				t.Fatal(err)
-			}
+			n := f.quantityChanges(1)
 			if q := f.license().Quantity; q != 2 || n != 1 {
 				t.Fatalf("after: quantity %d, quantity_changed recorded %d times; want 2 and once", q, n)
 			}
@@ -1770,11 +1762,7 @@ func TestSeats_RefusedDowngradeAnnouncesNothing(t *testing.T) {
 	}
 	f.fake.updateErr = 0
 	f.subscriptionUpdated()
-	var n int
-	time.Sleep(200 * time.Millisecond) // audit entries are written in the background
-	if err := f.s.DB.NewRaw("SELECT COUNT(*) FROM audit_logs WHERE entity_id = ? AND action = 'quantity_changed'", f.lic.ID).Scan(f.ctx, &n); err != nil {
-		t.Fatal(err)
-	}
+	n := f.quantityChanges(0)
 	if q := f.license().Quantity; q != 5 || n != 0 {
 		t.Fatalf("after a refused downgrade: quantity %d, quantity_changed recorded %d times; want 5 and none", q, n)
 	}
@@ -1831,11 +1819,7 @@ func TestSeats_DowngradeMadeButUnansweredIsAskedAgain(t *testing.T) {
 	if c, out := f.change(p, ""); c != http.StatusOK || envData(out)["status"] != "applied" {
 		t.Fatalf("change = %d %v, want applied", c, out)
 	}
-	var n int
-	time.Sleep(200 * time.Millisecond) // audit entries are written in the background
-	if err := f.s.DB.NewRaw("SELECT COUNT(*) FROM audit_logs WHERE entity_id = ? AND action = 'quantity_changed'", f.lic.ID).Scan(f.ctx, &n); err != nil {
-		t.Fatal(err)
-	}
+	n := f.quantityChanges(1)
 	if q := f.license().Quantity; q != 2 || n != 1 {
 		t.Fatalf("quantity %d, announced %d times; want 2, once", q, n)
 	}
@@ -1960,36 +1944,50 @@ func TestSeats_UnknownDowngradeAppliesTheRead(t *testing.T) {
 	}
 }
 
+// quantityChanges counts the licence's quantity_changed audit entries
+// once want of them are there. They are written in the background
+// (Store.Audit), so it waits for them, up to five seconds, and then a
+// moment longer for any extra one to arrive: a fixed sleep was outlasted
+// on a loaded machine, failing a test whose behaviour was right. With
+// want 0 there is nothing to wait for but that moment.
+func (f *seatFixture) quantityChanges(want int) int {
+	f.t.Helper()
+	read := func() int {
+		var n int
+		if err := f.s.DB.NewRaw("SELECT COUNT(*) FROM audit_logs WHERE entity_id = ? AND action = 'quantity_changed'",
+			f.lic.ID).Scan(f.ctx, &n); err != nil {
+			f.t.Fatal(err)
+		}
+		return n
+	}
+	for deadline := time.Now().Add(5 * time.Second); read() < want && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	return read()
+}
+
 // A downgrade that ends unanswered is announced as the licence moves:
 // once when it takes the lower seats, and once more, the other way, if
 // Stripe turns out not to have made it.
 func TestSeats_UnknownDowngradeAnnouncedAsTheLicenceMoves(t *testing.T) {
-	count := func(f *seatFixture) int {
-		time.Sleep(200 * time.Millisecond) // audit entries are written in the background
-		var n int
-		time.Sleep(200 * time.Millisecond) // audit entries are written in the background
-		if err := f.s.DB.NewRaw("SELECT COUNT(*) FROM audit_logs WHERE entity_id = ? AND action = 'quantity_changed'", f.lic.ID).Scan(f.ctx, &n); err != nil {
-			t.Fatal(err)
-		}
-		return n
-	}
 	f := newSeatFixture(t, 5)
 	p := f.preview(fmt.Sprintf(`{"license_id":%q,"quantity":2}`, f.lic.ID))
 	f.fake.updateErr = http.StatusServiceUnavailable
 	if c, _ := f.change(p, ""); c != http.StatusAccepted {
 		t.Fatalf("change = %d, want 202", c)
 	}
-	if n := count(f); n != 1 {
+	if n := f.quantityChanges(1); n != 1 {
 		t.Fatalf("announced %d times on the lower seats, want once", n)
 	}
 	f.fake.updateErr = 0
 	f.subscriptionUpdated() // Stripe still bills 5, but may yet make it: held
-	if q, n := f.license().Quantity, count(f); q != 2 || n != 1 {
+	if q, n := f.license().Quantity, f.quantityChanges(1); q != 2 || n != 1 {
 		t.Fatalf("while held: quantity %d, announced %d times; want 2 and once", q, n)
 	}
 	f.endHold()
 	f.subscriptionUpdated() // the hold is over, and Stripe still bills 5: not made
-	if q, n := f.license().Quantity, count(f); q != 5 || n != 2 {
+	if q, n := f.license().Quantity, f.quantityChanges(2); q != 5 || n != 2 {
 		t.Fatalf("after Stripe showed it not made: quantity %d, announced %d times; want 5 and twice", q, n)
 	}
 }
@@ -2027,12 +2025,7 @@ func TestSeats_DowngradeSentAgainAnnouncedOnce(t *testing.T) {
 	if c, out := f.change(p, ""); c != http.StatusOK || envData(out)["status"] != "applied" {
 		t.Fatalf("again = %d %v, want applied", c, out)
 	}
-	time.Sleep(200 * time.Millisecond) // audit entries are written in the background
-	var n int
-	if err := f.s.DB.NewRaw("SELECT COUNT(*) FROM audit_logs WHERE entity_id = ? AND action = 'quantity_changed'", f.lic.ID).Scan(f.ctx, &n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 1 {
+	if n := f.quantityChanges(1); n != 1 {
 		t.Fatalf("announced %d times, want once", n)
 	}
 }
@@ -2043,18 +2036,10 @@ func TestSeats_QuantityOnAPlanNotPerSeatIsNotAnnounced(t *testing.T) {
 	f := newSeatFixture(t, 1)
 	f.fake.set(f.solo.StripePriceID, 1)
 	f.subscriptionUpdated()
-	time.Sleep(200 * time.Millisecond)
-	var before int
-	if err := f.s.DB.NewRaw("SELECT COUNT(*) FROM audit_logs WHERE entity_id = ? AND action = 'quantity_changed'", f.lic.ID).Scan(f.ctx, &before); err != nil {
-		t.Fatal(err)
-	}
+	before := f.quantityChanges(0)
 	f.fake.set(f.solo.StripePriceID, 3)
 	f.subscriptionUpdated()
-	time.Sleep(200 * time.Millisecond) // audit entries are written in the background
-	var n int
-	if err := f.s.DB.NewRaw("SELECT COUNT(*) FROM audit_logs WHERE entity_id = ? AND action = 'quantity_changed'", f.lic.ID).Scan(f.ctx, &n); err != nil {
-		t.Fatal(err)
-	}
+	n := f.quantityChanges(0)
 	if q := f.license().Quantity; q != 3 || n != before {
 		t.Fatalf("quantity %d, quantity_changed %d more; want 3 and none", q, n-before)
 	}

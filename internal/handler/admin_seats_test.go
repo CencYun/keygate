@@ -218,8 +218,11 @@ func TestAdminFindsMembers(t *testing.T) {
 	}
 
 	for name, q := range map[string]string{
-		"member's address":         strings.ToUpper(p.alice.Email),
-		"member's key, its prefix": p.aliceKey[:len(p.aliceKey)-5],
+		"member's address":           strings.ToUpper(p.alice.Email),
+		"an address with spaces":     "  " + p.alice.Email + " ",
+		"member's whole key":         p.aliceKey,
+		"member's key, in lowercase": strings.ToLower(p.aliceKey),
+		"the whole licence key":      lic.LicenseKey,
 	} {
 		ls, _, err := f.s.ListLicenses(f.ctx, store.LicenseListFilter{Search: q, Limit: 50})
 		if err != nil {
@@ -233,6 +236,26 @@ func TestAdminFindsMembers(t *testing.T) {
 			t.Fatalf("searching by the %s did not find the licence", name)
 		}
 	}
+	// A key is found only whole, never by a part that would let a key
+	// be guessed a character at a time; and the term is literal: % and
+	// _ match only themselves.
+	for name, q := range map[string]string{
+		"all but the last character of a member's key": p.aliceKey[:len(p.aliceKey)-1],
+		"the start of the licence key":                 lic.LicenseKey[:12],
+		"a lone _":                                     "_",
+		"a lone %":                                     "%",
+	} {
+		ls, _, err := f.s.ListLicenses(f.ctx, store.LicenseListFilter{Search: q, Limit: 500})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, l := range ls {
+			if l.ID == lic.ID {
+				t.Fatalf("searching by %s found the licence", name)
+			}
+		}
+	}
+
 	// A removed member's address no longer does.
 	ls, _, err := f.s.ListLicenses(f.ctx, store.LicenseListFilter{Search: p.gone.Email, Limit: 50})
 	if err != nil {

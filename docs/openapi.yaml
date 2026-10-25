@@ -1882,6 +1882,9 @@ paths:
                                 upgradable:
                                   type: boolean
                                   description: The user owns this license and can upgrade it to a paid plan now (`POST /portal/licenses/upgrade`)
+                                cancel_scheduled:
+                                  type: boolean
+                                  description: Only for the owner; the license's subscription is set to end at its period end (`valid_until`) rather than renew
                       renewals_enabled:
                         type: boolean
                         description: Whether maintenance renewals are on sale (`POST /portal/updates/renew`)
@@ -3084,11 +3087,12 @@ paths:
         - name: search
           in: query
           description: |
-            Free-text search over the list: the owner's address or the
-            license key's start, and likewise the address of a member or
-            of an invitation not yet accepted, or the start of a member's
-            own key, which finds the license they are on. Removed seats
-            are not searched.
+            Free-text search over the list: part of the owner's address,
+            or of the address of a member or of an invitation not yet
+            accepted (matched literally: `%` and `_` are not wildcards),
+            or a whole key, the license's or a member's own, which finds
+            the license they are on. A key is never matched in part.
+            Removed seats are not searched.
           schema: { type: string }
         - { name: external_customer_id, in: query, schema: { type: string } }
         - { name: external_workspace_id, in: query, schema: { type: string } }
@@ -3669,10 +3673,17 @@ paths:
         Requires the `admin` or `licenses:write` scope; a bound key only
         for its product's licenses. For a license nothing bills, such as
         a sale made outside Stripe: a Stripe subscription's seats are its
-        quantity in Stripe and are refused here (`STRIPE_MANAGED`).
-        Members or devices above a lower limit stay; new ones are refused
-        until there is room. Sends `license.quantity_changed` when the
-        seats changed. Answers with the license, its limits included.
+        quantity in Stripe and are refused here (`STRIPE_MANAGED`). The
+        quantity must be one the plan sells, its `min_quantity` to
+        `max_quantity` (`QUANTITY_OUT_OF_RANGE`), and lowering it is
+        refused below what the license uses, as the owner's change in the
+        portal is: its people, the owner and invitations included
+        (`SEATS_IN_USE`), and its devices, or floating sessions on a
+        floating plan, against the devices the new seats hold
+        (`DEVICES_IN_USE`). Nobody and nothing is removed by a change of
+        seats; the room is freed first. Sends `license.quantity_changed`
+        when the seats changed. Answers with the license, its limits
+        included.
       x-required-scopes: [admin, "licenses:write"]
       security:
         - BearerAuth: []
@@ -3699,7 +3710,7 @@ paths:
                   success: { type: boolean, example: true }
                   data: { $ref: "#/components/schemas/License" }
         "400":
-          description: "`BAD_REQUEST`: quantity missing or out of range"
+          description: "`BAD_REQUEST`: quantity missing or outside 1 to 10000"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "404":
           description: "`NOT_FOUND`: no such license"
@@ -3708,6 +3719,9 @@ paths:
           description: |
             - `STRIPE_MANAGED`: a Stripe subscription bills the license
             - `NOT_PER_SEAT`: the license's plan is not sold per seat
+            - `QUANTITY_OUT_OF_RANGE`: outside the plan's `min_quantity` to `max_quantity` (`details`: `min`, `max`, as the portal's)
+            - `SEATS_IN_USE`: more people than the seats asked for (`details`: `in_use`, `seat_limit`)
+            - `DEVICES_IN_USE`: more devices, or sessions, than the seats asked for hold (`details`: `in_use`, `activation_limit`, `kind`)
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
 
   /admin/licenses/{id}/valid-until:

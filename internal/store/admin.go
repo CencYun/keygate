@@ -580,6 +580,25 @@ var ErrQuantityStripeManaged = errors.New("the quantity of a Stripe-billed licen
 // quantity would change nothing it holds.
 var ErrQuantityNotPerSeat = errors.New("the license's plan is not sold per seat")
 
+// QuantityRangeError: the quantity is outside what the licence's plan
+// sells, Min to Max seats, as a checkout or the portal would refuse it.
+type QuantityRangeError struct{ Min, Max int }
+
+func (e *QuantityRangeError) Error() string {
+	return fmt.Sprintf("the plan sells %d to %d seats", e.Min, e.Max)
+}
+
+// QuantityInUseError: the quantity is below what the licence uses, as
+// the portal refuses a downgrade (Code SEATS_IN_USE or DEVICES_IN_USE,
+// Kind activations or sessions for the latter). Nobody and nothing is
+// removed by a change of seats, so the room is freed first.
+type QuantityInUseError struct {
+	Code, Kind   string
+	InUse, Limit int
+}
+
+func (e *QuantityInUseError) Error() string { return e.Code }
+
 // SetLicenseQuantity sets how many seats a licence nothing bills holds
 // (an offline sale, say) and returns what it had. The licence row is
 // locked for the decision, so a Stripe subscription linked meanwhile
@@ -587,12 +606,17 @@ var ErrQuantityNotPerSeat = errors.New("the license's plan is not sold per seat"
 func (s *Store) SetLicenseQuantity(ctx context.Context, id string, quantity int) (prev int, err error) {
 	err = RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
 		var row struct {
-			Quantity     int            `bun:"quantity"`
-			Subscription sql.NullString `bun:"stripe_subscription_id"`
-			PerSeat      sql.NullBool   `bun:"per_seat"`
+			Quantity       int            `bun:"quantity"`
+			Subscription   sql.NullString `bun:"stripe_subscription_id"`
+			PerSeat        sql.NullBool   `bun:"per_seat"`
+			MinQuantity    sql.NullInt64  `bun:"min_quantity"`
+			MaxQuantity    sql.NullInt64  `bun:"max_quantity"`
+			MaxActivations sql.NullInt64  `bun:"max_activations"`
+			LicenseModel   sql.NullString `bun:"license_model"`
 		}
 		if err := tx.NewRaw(`
-			SELECT l.quantity, l.stripe_subscription_id, p.per_seat FROM licenses l
+			SELECT l.quantity, l.stripe_subscription_id, p.per_seat, p.min_quantity, p.max_quantity,
+				p.max_activations, p.license_model FROM licenses l
 			LEFT JOIN plans p ON p.id = l.plan_id
 			WHERE l.id = ? FOR UPDATE OF l`, id).Scan(ctx, &row); err != nil {
 			return err
@@ -603,7 +627,30 @@ func (s *Store) SetLicenseQuantity(ctx context.Context, id string, quantity int)
 		if !row.PerSeat.Bool {
 			return ErrQuantityNotPerSeat
 		}
+		if min, max := int(row.MinQuantity.Int64), int(row.MaxQuantity.Int64); quantity < min || quantity > max {
+			return &QuantityRangeError{Min: min, Max: max}
+		}
 		prev = row.Quantity
+		// Lower: not below what is in use, counted under the lock every
+		// slot is taken under. One that leaves a licence over a limit it
+		// was already over, but no further, goes ahead, as in the portal.
+		if quantity < prev {
+			used, err := countInUse(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			if used.People > quantity {
+				return &QuantityInUseError{Code: "SEATS_IN_USE", InUse: used.People, Limit: quantity}
+			}
+			devices := int(row.MaxActivations.Int64) * quantity
+			n, kind := used.Activations, "activations"
+			if row.LicenseModel.String == "floating" && used.Sessions > devices && used.Sessions >= n {
+				n, kind = used.Sessions, "sessions"
+			}
+			if devices > 0 && n > devices {
+				return &QuantityInUseError{Code: "DEVICES_IN_USE", Kind: kind, InUse: n, Limit: devices}
+			}
+		}
 		_, err := tx.NewRaw(`UPDATE licenses SET quantity = ?, updated_at = now() WHERE id = ?`, quantity, id).Exec(ctx)
 		return err
 	})

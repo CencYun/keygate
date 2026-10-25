@@ -376,15 +376,22 @@ func (s *Store) AcceptSeatInvite(ctx context.Context, plainToken string) (*model
 	}
 
 	now := time.Now()
+	// A pending seat holds no key; one left from before (an older
+	// version removed and re-invited it without clearing) is dropped, so
+	// the member gets a new key rather than the one they had before.
 	if _, err := tx.NewUpdate().Model((*model.Seat)(nil)).
 		Set("user_id = ?", user.ID).
 		Set("accepted_at = ?", now).
 		Set("invite_token_hash = NULL").
 		Set("invite_expires_at = NULL").
+		Set("member_key = NULL").
+		Set("member_key_hash = NULL").
+		Set("member_key_encrypted = NULL").
 		Where("id = ?", seat.ID).
 		Exec(ctx); err != nil {
 		return nil, nil, err
 	}
+	seat.MemberKey, seat.MemberKeyHash, seat.MemberKeyEncrypted = "", "", nil
 	seat.UserID = user.ID
 	seat.AcceptedAt = &now
 	seat.InviteTokenHash = ""

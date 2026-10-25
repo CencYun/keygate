@@ -529,3 +529,136 @@ func TestSeatRestoreReportsStaleDevices(t *testing.T) {
 		t.Fatalf("license.deactivated after bringing the member back = %d (%v), want one per stale device", sent, err)
 	}
 }
+
+// The hourly sweep finishes what an older version left during a rolling
+// upgrade: a member it removed loses the key and devices it kept (each
+// device reported as deactivated, once), and a seat it gave the admin
+// role becomes a member. A seat on the team is never touched, and a
+// second sweep does nothing more.
+func TestFinishSeatRemovals(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("skipping integration test: TEST_DATABASE_URL not set")
+	}
+	s, err := store.New(dsn)
+	if err != nil {
+		t.Skipf("skipping integration test: %v", err)
+	}
+	defer s.Close()
+	if err := s.RunMigrations("../../db/migrations"); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	ctx := context.Background()
+	suffix := time.Now().Format("150405.000000")
+	prod := &model.Product{Name: "Sweep", Slug: "sweep-" + suffix, Type: "hybrid"}
+	if err := s.CreateProduct(ctx, prod); err != nil {
+		t.Fatal(err)
+	}
+	plan := &model.Plan{ProductID: prod.ID, Name: "Team", Slug: "sweep-" + suffix, LicenseType: "perpetual",
+		LicenseModel: "standard", MaxActivations: 10, MaxSeats: 5, Active: true}
+	if err := s.CreatePlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	lic := &model.License{ProductID: prod.ID, PlanID: plan.ID, Email: "owner-sweep-" + suffix + "@example.com",
+		LicenseKey: "KG-SWEEP-" + suffix, Status: model.StatusActive}
+	if err := s.CreateLicense(ctx, lic); err != nil {
+		t.Fatal(err)
+	}
+	hook := &model.Webhook{ProductID: prod.ID, URL: "http://127.0.0.1:9/hook", Secret: "s",
+		Events: []string{model.EventLicenseDeactivated}, Active: true}
+	if err := s.CreateWebhook(ctx, hook); err != nil {
+		t.Fatal(err)
+	}
+	member := func(who string) (*model.Seat, string) {
+		t.Helper()
+		plain, hash := store.GenerateSeatInviteToken()
+		expires := time.Now().Add(time.Hour)
+		seat := &model.Seat{LicenseID: lic.ID, Email: who + "-sweep-" + suffix + "@example.com", Role: "member",
+			InviteTokenHash: hash, InviteExpiresAt: &expires}
+		if _, _, err := s.AddSeatWithinLimit(ctx, seat, 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.AcceptSeatInvite(ctx, plain); err != nil {
+			t.Fatal(err)
+		}
+		seat, _ = s.FindSeatByID(ctx, seat.ID)
+		key, err := s.MemberKey(ctx, seat)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return seat, key
+	}
+	gone, goneKey := member("gone")
+	stays, staysKey := member("stays")
+	back, backKey := member("back")
+	for _, d := range []struct{ seat, key, device string }{
+		{gone.ID, goneKey, "gone-pc1"}, {gone.ID, goneKey, "gone-pc2"}, {stays.ID, staysKey, "stays-pc"},
+		{back.ID, backKey, "back-pc"},
+	} {
+		if err := s.ActivateForKey(ctx, &model.Activation{LicenseID: lic.ID, Identifier: d.device, IdentifierType: "device", SeatID: d.seat}, 10, d.key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// What an older version leaves: removed_at alone, and an admin seat.
+	if _, err := s.DB.NewRaw("UPDATE seats SET removed_at = now() WHERE id = ?", gone.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.NewRaw("UPDATE seats SET role = 'admin' WHERE id = ?", stays.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Removed and invited back by an older version: pending again, still
+	// holding the key and device it had.
+	_, backHash := store.GenerateSeatInviteToken()
+	if _, err := s.DB.NewRaw(`UPDATE seats SET accepted_at = NULL, user_id = NULL, invite_token_hash = ?,
+		invite_expires_at = now() + interval '1 hour' WHERE id = ?`, backHash, back.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewExpiryChecker(s, nil, NewWebhookService(s, slog.Default(), time.Second, 1, true), slog.Default())
+	sent := func() int {
+		t.Helper()
+		var n int
+		if err := s.DB.NewRaw("SELECT count(*) FROM webhook_deliveries WHERE webhook_id = ? AND event = ?", hook.ID, model.EventLicenseDeactivated).Scan(ctx, &n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	for range 2 {
+		c.FinishSeatRemovals(ctx)
+	}
+	if n := sent(); n != 3 {
+		t.Fatalf("license.deactivated after two sweeps = %d, want one per leftover device (3)", n)
+	}
+	b, _ := s.FindSeatByID(ctx, back.ID)
+	if b.MemberKeyHash != "" || b.AcceptedAt != nil || b.InviteTokenHash != backHash {
+		t.Fatalf("the seat invited back: key kept %v, accepted %v, invite kept %v; want no key, still pending with its invite",
+			b.MemberKeyHash != "", b.AcceptedAt != nil, b.InviteTokenHash == backHash)
+	}
+	if _, err := s.FindActivation(ctx, lic.ID, "back-pc"); err == nil {
+		t.Fatal("the device of the seat invited back is still there")
+	}
+	g, _ := s.FindSeatByID(ctx, gone.ID)
+	if g.MemberKeyHash != "" || g.MemberKey != "" {
+		t.Fatal("the removed seat kept its key")
+	}
+	var left int
+	if err := s.DB.NewRaw("SELECT count(*) FROM activations WHERE seat_id = ?", gone.ID).Scan(ctx, &left); err != nil || left != 0 {
+		t.Fatalf("%d devices left on the removed seat (%v)", left, err)
+	}
+	st, _ := s.FindSeatByID(ctx, stays.ID)
+	if st.Role != "member" || st.MemberKeyHash == "" {
+		t.Fatalf("the seat on the team: role %q, key kept %v; want a member with its key", st.Role, st.MemberKeyHash != "")
+	}
+	if _, err := s.FindActivation(ctx, lic.ID, "stays-pc"); err != nil {
+		t.Fatal("the device of a seat on the team was removed")
+	}
+	// One cleared already is done: another sweep (another replica's)
+	// reports nothing, and audits nothing more.
+	if devices, done, err := s.ClearSeatLeftovers(ctx, gone.ID); err != nil || done || len(devices) != 0 {
+		t.Fatalf("clearing it again = %v, %v, %v; want nothing done", devices, done, err)
+	}
+	// A seat on the team is not a leftover, whatever is asked.
+	if devices, done, err := s.ClearSeatLeftovers(ctx, stays.ID); err != nil || done || len(devices) != 0 {
+		t.Fatalf("clearing a seat on the team = %v, %v, %v; want nothing done", devices, done, err)
+	}
+}

@@ -2894,6 +2894,25 @@ func (h *AdminHandler) SetLicenseQuantity(c *gin.Context) {
 	case errors.Is(err, store.ErrQuantityNotPerSeat):
 		response.Conflict(c, "NOT_PER_SEAT", "this license's plan is not sold per seat", nil)
 		return
+	}
+	var outOfRange *store.QuantityRangeError
+	var inUse *store.QuantityInUseError
+	switch {
+	case errors.As(err, &outOfRange):
+		response.Conflict(c, "QUANTITY_OUT_OF_RANGE",
+			fmt.Sprintf("this license's plan sells %d to %d seats", outOfRange.Min, outOfRange.Max),
+			gin.H{"min": outOfRange.Min, "max": outOfRange.Max})
+		return
+	case errors.As(err, &inUse) && inUse.Code == "SEATS_IN_USE":
+		response.Conflict(c, "SEATS_IN_USE",
+			fmt.Sprintf("%d people are on or invited to this license; remove %d before going down to %d seats", inUse.InUse, inUse.InUse-inUse.Limit, inUse.Limit),
+			gin.H{"in_use": inUse.InUse, "seat_limit": inUse.Limit})
+		return
+	case errors.As(err, &inUse):
+		response.Conflict(c, "DEVICES_IN_USE",
+			fmt.Sprintf("%d %s in use on this license; free %d before going down to %d", inUse.InUse, inUse.Kind, inUse.InUse-inUse.Limit, inUse.Limit),
+			gin.H{"in_use": inUse.InUse, "activation_limit": inUse.Limit, "kind": inUse.Kind})
+		return
 	case err != nil:
 		response.Internal(c, err)
 		return

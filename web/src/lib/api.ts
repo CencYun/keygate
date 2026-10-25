@@ -858,6 +858,8 @@ export interface PortalLicense extends License {
   license_key: string
   // The owner can upgrade it to a paid plan now, keeping the key.
   upgradable?: boolean
+  // Its subscription ends at the period end rather than renews (owner only).
+  cancel_scheduled?: boolean
 }
 
 export interface Activation {
