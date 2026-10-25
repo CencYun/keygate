@@ -543,11 +543,11 @@ func (s *LicenseService) assertUsable(lic *model.License) error {
 	}
 }
 
+// maxActivations is how many devices the licence holds: its plan's, or
+// for a plan sold per seat that many for each seat it is paid for.
 func (s *LicenseService) maxActivations(lic *model.License) int {
-	if lic.Plan != nil {
-		return lic.Plan.MaxActivations
-	}
-	return 3
+	_, activations := lic.Limits()
+	return activations
 }
 
 func (s *LicenseService) graceDays(lic *model.License) int {

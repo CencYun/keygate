@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -411,6 +412,9 @@ func main() {
 		Email:         emailSvc,
 		WebhookSvc:    webhookSvc,
 		Livemode:      cfg.StripeLivemode,
+		// Previews of subscription changes are signed with a key every
+		// replica derives from the same secret.
+		ChangeKey: changePreviewKey(cfg.JWTSecret),
 	}
 	// Initialize thread-safe webhook secret with config value
 	stripeH.SetWebhookSecret(cfg.StripeWebhookSecret)
@@ -553,6 +557,7 @@ func main() {
 					stripeH.SyncPendingCheckouts(ctx)
 					stripeH.RetireReplacedEndpoint(ctx)
 					stripeH.SyncCancelStates(ctx)
+					stripeH.SyncLapsedTermHolds(ctx)
 				}
 			}
 		}()
@@ -905,6 +910,7 @@ func main() {
 				// plan now (see StripeHandler.UpgradableLicenses).
 				Upgradable bool `json:"upgradable"`
 			}
+			model.FillLimits(licenses...)
 			upgradable, err := stripeH.UpgradableLicenses(c, emailStr, licenses)
 			if err != nil {
 				response.Internal(c, err)
@@ -987,6 +993,11 @@ func main() {
 						// The portal's upgrade offers no plan selling an
 						// update period; it needs this to leave them out.
 						"updates_days": p.UpdatesDays,
+						// A plan sold per seat lets the customer pick the
+						// seats when switching to it, and the portal shows
+						// what they include.
+						"per_seat": p.PerSeat, "min_quantity": p.MinQuantity, "max_quantity": p.MaxQuantity,
+						"max_activations": p.MaxActivations, "max_seats": p.MaxSeats, "license_model": p.LicenseModel,
 					})
 				}
 			}
@@ -1135,7 +1146,13 @@ func main() {
 		// (see stripe.go), so nesting under /portal makes the URL
 		// match the trust model rather than reading like a system
 		// endpoint sitting at the top level.
-		portal.POST("/subscription/change-plan", stripeH.ChangePlan)
+		// Seats and plan changes, previewed first. Each call reads
+		// Stripe, so they have a bucket of their own.
+		subChangeLimit := middleware.RateLimitByIPScoped("subscription_change", 30, time.Minute)
+		portal.POST("/subscription/change-plan", subChangeLimit, stripeH.ChangePlan)
+		portal.POST("/subscription/preview", subChangeLimit, stripeH.PreviewSubscriptionChange)
+		portal.POST("/subscription/change", subChangeLimit, stripeH.ChangeSubscription)
+		portal.POST("/subscription/pending", subChangeLimit, stripeH.PendingSubscriptionChange)
 		portal.POST("/subscription/cancel", stripeH.CancelSubscription)
 		portal.POST("/subscription/billing-portal", stripeH.CreatePortalSession)
 		portal.GET("/subscription/invoices", stripeH.ListInvoices)
@@ -1213,6 +1230,7 @@ func main() {
 		licWrite.POST("/licenses/:id/suspend", adminH.SuspendLicense)
 		licWrite.POST("/licenses/:id/reinstate", adminH.ReinstateLicense)
 		licWrite.POST("/licenses/:id/valid-until", adminH.SetLicenseValidUntil)
+		licWrite.POST("/licenses/:id/quantity", adminH.SetLicenseQuantity)
 		licWrite.POST("/licenses/:id/updates-until", adminH.SetLicenseUpdatesUntil)
 		licWrite.POST("/licenses/:id/change-plan", adminH.ChangeLicensePlan)
 		// Cuts a licence loose from a subscription Stripe has
@@ -1485,4 +1503,11 @@ func serveFrontend(r *gin.Engine) {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", html)
 		c.Abort()
 	})
+}
+
+// changePreviewKey is the key subscription change previews are signed
+// with, kept apart from the session tokens the same secret signs.
+func changePreviewKey(secret string) []byte {
+	sum := sha256.Sum256([]byte("keygate subscription change preview\x00" + secret))
+	return sum[:]
 }

@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -926,6 +928,148 @@ func (s *Store) UpdateLicenseFromSubscriptionRead(ctx context.Context, lic *mode
 	return s.updateLicenseAndSubscription(ctx, lic, true, &asOf, cols...)
 }
 
+// LicenseTerms are what a licence is paid for: its plan and how many
+// seats.
+type LicenseTerms struct {
+	PlanID   string `bun:"plan_id"`
+	Quantity int    `bun:"quantity"`
+}
+
+// UpdateLicenseFromSubscriptionReadTerms is UpdateLicenseFromSubscriptionRead
+// for a write that may move the licence's plan or quantity. It returns
+// them as they stood under the row lock just before the write, so the
+// caller announces a change only when this write is the one that made
+// it: two deliveries of the same change both find the old values in
+// their own copy of the licence, and only the first finds them here.
+//
+// A licence an operator suspended refuses the write (ErrLicenseRestricted)
+// but still takes the plan and seats Stripe bills, so it does not come
+// back from the suspension with seats nobody pays for. written says the
+// terms were written, either way: not while a downgrade holds them (see
+// LowerLicenseTerms) and this read still shows the old ones.
+func (s *Store) UpdateLicenseFromSubscriptionReadTerms(ctx context.Context, lic *model.License, asOf time.Time, cols ...string) (before LicenseTerms, written bool, err error) {
+	restricted, held := false, false
+	err = RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		var row struct {
+			LicenseTerms
+			Held bool `bun:"held"`
+		}
+		if err := tx.NewRaw(`SELECT plan_id, quantity, COALESCE(terms_held_until > clock_timestamp(), false) AS held
+			FROM licenses WHERE id = ? FOR UPDATE`, lic.ID).Scan(ctx, &row); err != nil {
+			return err
+		}
+		before = row.LicenseTerms
+		// While a downgrade may still be with Stripe (see
+		// LowerLicenseTerms) the plan and seats stay as it set them, unless
+		// this read shows them: then Stripe has made it, and the hold goes.
+		shows := lic.Quantity == before.Quantity && (!slices.Contains(cols, "plan_id") || lic.PlanID == before.PlanID)
+		if row.Held && !shows {
+			cols = slices.DeleteFunc(slices.Clone(cols), func(c string) bool { return c == "plan_id" || c == "quantity" })
+			held = true
+		}
+		written = !row.Held || shows
+		err := updateLicenseAndSubscriptionIn(ctx, tx, lic, true, &asOf, cols...)
+		// A hold the read shows the change for ends; so does one whose
+		// time is up, once terms are written over it.
+		if err == nil && slices.Contains(cols, "quantity") {
+			if _, err := tx.NewRaw("UPDATE licenses SET terms_held_until = NULL, terms_check_after = NULL WHERE id = ? AND terms_held_until IS NOT NULL", lic.ID).Exec(ctx); err != nil {
+				return err
+			}
+		}
+		if errors.Is(err, ErrLicenseRestricted) && slices.Contains(cols, "quantity") {
+			planID := before.PlanID
+			if slices.Contains(cols, "plan_id") {
+				planID = lic.PlanID
+			}
+			res, qerr := tx.NewRaw(`UPDATE licenses SET quantity = ?, plan_id = ?, stripe_synced_at = ?, updated_at = now()
+				WHERE id = ? AND stripe_subscription_id = ? AND (stripe_synced_at IS NULL OR stripe_synced_at <= ?)`,
+				lic.Quantity, planID, asOf, lic.ID, lic.StripeSubscriptionID, asOf).Exec(ctx)
+			if qerr != nil {
+				return qerr
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return err
+			}
+			// The subscription row names the plan too.
+			if _, qerr := tx.NewRaw(`UPDATE subscriptions SET plan_id = ?, updated_at = now()
+				WHERE license_id = ? AND plan_id <> ?`, planID, lic.ID, planID).Exec(ctx); qerr != nil {
+				return qerr
+			}
+			restricted = true
+			return nil
+		}
+		return err
+	})
+	if err != nil {
+		return before, false, err
+	}
+	if restricted {
+		return before, written, ErrLicenseRestricted
+	}
+	if held {
+		return before, written, ErrTermsHeld
+	}
+	return before, written, nil
+}
+
+// ErrTermsHeld: the read was written but for the plan and seats, which a
+// downgrade holds (see LowerLicenseTerms) and the read did not show. A
+// caller that can be asked again later (a webhook) is, once the hold is
+// over.
+var ErrTermsHeld = errors.New("license terms are held by a downgrade")
+
+// LicenseTermsHeld reports whether a downgrade holds the licence's terms
+// now (see LowerLicenseTerms).
+func (s *Store) LicenseTermsHeld(ctx context.Context, licenseID string) (bool, error) {
+	var held bool
+	err := s.DB.NewRaw("SELECT COALESCE(terms_held_until > clock_timestamp(), false) FROM licenses WHERE id = ?", licenseID).Scan(ctx, &held)
+	return held, err
+}
+
+// FindLapsedTermHolds lists licences whose downgrade hold ran out with
+// no read since to settle it: the change's outcome was never known, and
+// no event may come to say. One whose last check could not finish waits
+// until its next check is due, behind the others. limit caps the batch.
+func (s *Store) FindLapsedTermHolds(ctx context.Context, limit int) ([]LapsedTermHold, error) {
+	var holds []LapsedTermHold
+	err := s.DB.NewRaw(`SELECT id, terms_held_until FROM licenses
+		WHERE terms_held_until IS NOT NULL AND terms_held_until <= clock_timestamp()
+		AND (terms_check_after IS NULL OR terms_check_after <= clock_timestamp())
+		ORDER BY terms_check_after NULLS FIRST, terms_held_until LIMIT ?`, limit).Scan(ctx, &holds)
+	return holds, err
+}
+
+// LapsedTermHold is a hold FindLapsedTermHolds found: the licence, and
+// the hold's end, which names it (a downgrade since holds until later).
+type LapsedTermHold struct {
+	LicenseID string    `bun:"id"`
+	Until     time.Time `bun:"terms_held_until"`
+}
+
+// PostponeTermsCheck puts off the next check of a lapsed hold by after,
+// keeping its record: the check could not finish, and is tried again
+// then. A hold placed since is another downgrade's, and is left alone.
+func (s *Store) PostponeTermsCheck(ctx context.Context, h LapsedTermHold, after time.Duration) error {
+	_, err := s.DB.NewRaw(`UPDATE licenses SET terms_check_after = clock_timestamp() + make_interval(secs => ?)
+		WHERE id = ? AND terms_held_until = ?`, after.Seconds(), h.LicenseID, h.Until).Exec(ctx)
+	return err
+}
+
+// SettleLapsedHold ends a lapsed hold once a check settled it. A hold
+// placed since is another downgrade's, and stays.
+func (s *Store) SettleLapsedHold(ctx context.Context, h LapsedTermHold) error {
+	_, err := s.DB.NewRaw(`UPDATE licenses SET terms_held_until = NULL, terms_check_after = NULL
+		WHERE id = ? AND terms_held_until = ?`, h.LicenseID, h.Until).Exec(ctx)
+	return err
+}
+
+// ReleaseLicenseTerms ends a downgrade's hold, once Stripe is known to
+// have made it: the next read sets the terms as Stripe has them.
+func (s *Store) ReleaseLicenseTerms(ctx context.Context, licenseID string) error {
+	_, err := s.DB.NewRaw("UPDATE licenses SET terms_held_until = NULL, terms_check_after = NULL WHERE id = ?", licenseID).Exec(ctx)
+	return err
+}
+
 // UpdateLicenseFromSubscriptionEnded is the write for a subscription that
 // is over (customer.subscription.deleted). It always applies — nothing in
 // Stripe can bring the subscription back, so a newer read can only agree
@@ -1018,6 +1162,14 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 	`, lic.Status, lic.ID, lic.Status).Exec(ctx); err != nil {
 		// Non-fatal: subscription may not exist
 		slog.Warn("sync subscription status failed", "license_id", lic.ID, "error", err)
+	}
+	// The subscription row names the plan too; a plan the licence moved
+	// to in Stripe moves it with the licence, or the two disagree.
+	if slices.Contains(cols, "plan_id") {
+		if _, err := tx.NewRaw(`UPDATE subscriptions SET plan_id = ?, updated_at = now()
+			WHERE license_id = ? AND plan_id <> ?`, lic.PlanID, lic.ID, lic.PlanID).Exec(ctx); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -2138,6 +2290,193 @@ func (s *Store) ClaimProcessedEvent(ctx context.Context, provider, eventID strin
 
 // ─── Transactional Activation ───
 
+// lockLicenseLimitsIn takes the licence row lock every "count, then take
+// a slot" check serialises on, and reads the limits the licence holds
+// under it (see model.Plan.Limits). The caller's limit came from a read
+// made before the lock, and a subscription read can lower the licence's
+// seats in between; checking against the stricter of the two keeps a
+// slot from being taken on a limit that is already gone. known is false
+// when the licence or its plan is not there to read, and the caller's
+// limit stands alone.
+func lockLicenseLimitsIn(ctx context.Context, tx bun.Tx, licenseID string) (seats, activations int, known bool, err error) {
+	var rows []struct {
+		Quantity       int   `bun:"quantity"`
+		PerSeat        *bool `bun:"per_seat"`
+		MaxSeats       *int  `bun:"max_seats"`
+		MaxActivations *int  `bun:"max_activations"`
+	}
+	if err := tx.NewRaw(`SELECT l.quantity, p.per_seat, p.max_seats, p.max_activations
+		FROM licenses l LEFT JOIN plans p ON p.id = l.plan_id
+		WHERE l.id = ? FOR UPDATE OF l`, licenseID).Scan(ctx, &rows); err != nil {
+		return 0, 0, false, err
+	}
+	if len(rows) == 0 || rows[0].PerSeat == nil || rows[0].MaxSeats == nil || rows[0].MaxActivations == nil {
+		return 0, 0, false, nil
+	}
+	r := rows[0]
+	plan := model.Plan{PerSeat: *r.PerSeat, MaxSeats: *r.MaxSeats, MaxActivations: *r.MaxActivations}
+	seats, activations = plan.Limits(r.Quantity)
+	return seats, activations, true, nil
+}
+
+// licenseChangeLock is the advisory lock class a change to a licence's
+// subscription takes, keyed by the licence (see LockLicenseChange).
+const licenseChangeLock = 41041
+
+// ErrChangeInProgress: another change to the licence's subscription is
+// with Stripe right now.
+var ErrChangeInProgress = errors.New("a change to this license is being made")
+
+// LockLicenseChange takes the licence's change lock: one change to its
+// subscription at a time. It waits up to wait for a change already under
+// way, then gives up with ErrChangeInProgress; nothing else waits for it.
+// Unlock gives it back; should the process stop first, the database
+// gives it back with the connection.
+func (s *Store) LockLicenseChange(ctx context.Context, licenseID string, wait time.Duration) (*ChangeLock, error) {
+	conn, err := s.DB.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		var got bool
+		if err := conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock(?, hashtext(?))", licenseChangeLock, licenseID).Scan(&got); err != nil {
+			// The lock may have been taken all the same: the connection
+			// is dropped rather than handed back holding it.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			_ = conn.Close()
+			return nil, err
+		}
+		if got {
+			return &ChangeLock{conn: conn, licenseID: licenseID}, nil
+		}
+		if time.Now().After(deadline) {
+			_ = conn.Close()
+			return nil, ErrChangeInProgress
+		}
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// ChangeLock is a licence's change lock, on a connection of its own.
+type ChangeLock struct {
+	conn      bun.Conn
+	licenseID string
+}
+
+// Unlock gives the change lock back.
+func (l *ChangeLock) Unlock() {
+	l.exec("SELECT pg_advisory_unlock_all()")
+	_ = l.conn.Close()
+}
+
+// exec runs an unlock with a context of its own: the request's may be
+// over, and no lock may outlive it on a pooled connection.
+func (l *ChangeLock) exec(query string, args ...any) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := l.conn.ExecContext(ctx, query, args...); err != nil {
+		// Handed back to the pool, a connection whose unlock failed would
+		// still hold the lock: it is dropped instead.
+		_ = l.conn.Raw(func(any) error { return driver.ErrBadConn })
+	}
+}
+
+// InUse is what a licence uses of its limits: its people (the owner
+// included), activations, and floating sessions running now.
+type InUse struct {
+	People, Activations, Sessions int
+}
+
+// CountInUse counts what a licence uses of its limits.
+func (s *Store) CountInUse(ctx context.Context, licenseID string) (InUse, error) {
+	return countInUse(ctx, s.DB, licenseID)
+}
+
+func countInUse(ctx context.Context, db bun.IDB, licenseID string) (InUse, error) {
+	var u InUse
+	if err := db.NewRaw(memberSeatsSQL, licenseID).Scan(ctx, &u.People); err != nil {
+		return u, err
+	}
+	u.People++
+	if err := db.NewRaw("SELECT COUNT(*) FROM activations WHERE license_id = ?", licenseID).Scan(ctx, &u.Activations); err != nil {
+		return u, err
+	}
+	if err := db.NewRaw("SELECT COUNT(*) FROM floating_sessions WHERE license_id = ? AND expires_at > now()", licenseID).Scan(ctx, &u.Sessions); err != nil {
+		return u, err
+	}
+	return u, nil
+}
+
+// LowerLicenseTerms moves a licence to lower terms ahead of the change
+// to its subscription that makes them, so nothing is taken meanwhile on
+// limits about to go: under the licence row lock (the one every slot is
+// taken under), what is in use is counted, check may refuse (its error
+// is returned as is, and nothing changes), and the terms are written.
+// The read stamp moves to now, so a read of the subscription from before
+// cannot put the old terms back; and the terms are held for hold, so no
+// read until then that still shows the old ones can either, whatever
+// becomes of the request that lowered them (a lost answer, a restart).
+// A read that shows the new terms ends the hold, as do
+// ReleaseLicenseTerms and RestoreLicenseTerms. It returns the terms
+// the licence had, for RestoreLicenseTerms should Stripe not make the
+// change.
+func (s *Store) LowerLicenseTerms(ctx context.Context, licenseID string, to LicenseTerms, hold time.Duration, check func(InUse) error) (prev LicenseTerms, err error) {
+	err = RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		if err := tx.NewRaw("SELECT plan_id, quantity FROM licenses WHERE id = ? FOR UPDATE", licenseID).Scan(ctx, &prev); err != nil {
+			return err
+		}
+		u, err := countInUse(ctx, tx, licenseID)
+		if err != nil {
+			return err
+		}
+		if err := check(u); err != nil {
+			return err
+		}
+		_, err = tx.NewRaw(`UPDATE licenses SET plan_id = ?, quantity = ?, stripe_synced_at = clock_timestamp(),
+			terms_held_until = clock_timestamp() + make_interval(secs => ?), terms_check_after = NULL, updated_at = now()
+			WHERE id = ?`, to.PlanID, to.Quantity, hold.Seconds(), licenseID).Exec(ctx)
+		return err
+	})
+	return prev, err
+}
+
+// MarkLicenseRead moves the licence's read stamp to now: every read of
+// its subscription that began before is out of date. A downgrade Stripe
+// may have made marks it so before its hold can end, so that no read
+// from before the change can put the old terms back.
+func (s *Store) MarkLicenseRead(ctx context.Context, licenseID string) error {
+	_, err := s.DB.NewRaw(`UPDATE licenses SET stripe_synced_at = GREATEST(stripe_synced_at, clock_timestamp()) WHERE id = ?`, licenseID).Exec(ctx)
+	return err
+}
+
+// RestoreLicenseTerms puts back the terms LowerLicenseTerms replaced,
+// for a change Stripe did not make, unless something has moved them
+// since.
+func (s *Store) RestoreLicenseTerms(ctx context.Context, licenseID string, lowered, prev LicenseTerms) error {
+	_, err := s.DB.NewRaw(`UPDATE licenses SET plan_id = ?, quantity = ?, stripe_synced_at = clock_timestamp(),
+		terms_held_until = NULL, terms_check_after = NULL, updated_at = now()
+		WHERE id = ? AND plan_id = ? AND quantity = ?`, prev.PlanID, prev.Quantity, licenseID, lowered.PlanID, lowered.Quantity).Exec(ctx)
+	return err
+}
+
+// stricterSeatLimit is the lower of two seat limits, where 0 means no
+// limit at all.
+func stricterSeatLimit(a, b int) int {
+	switch {
+	case a <= 0:
+		return b
+	case b <= 0:
+		return a
+	}
+	return min(a, b)
+}
+
 // ActivateWithinLimit atomically creates an activation only if the limit hasn't been reached.
 // Locks the license row (not activation rows) to serialize concurrent activations.
 // ErrAlreadyActivated reports that this machine already holds an
@@ -2169,10 +2508,15 @@ func (s *Store) ActivateWithinLimit(ctx context.Context, act *model.Activation, 
 	}
 	defer tx.Rollback()
 
-	// Lock the license row to serialize concurrent activations
-	_, err = tx.NewRaw("SELECT id FROM licenses WHERE id = ? FOR UPDATE", act.LicenseID).Exec(ctx)
+	// Lock the license row to serialize concurrent activations, and
+	// hold the activation to the limit the licence has now: its seats
+	// may have gone down since the caller read it.
+	_, held, known, err := lockLicenseLimitsIn(ctx, tx, act.LicenseID)
 	if err != nil {
 		return err
+	}
+	if known {
+		maxActivations = min(maxActivations, held)
 	}
 
 	// This machine may already hold a slot, in which case it is not
@@ -2415,7 +2759,7 @@ func (s *Store) MarkEmailFailedPermanent(ctx context.Context, id, token, errMsg 
 // which is why every licence without a subscription holds NULL.
 func (s *Store) ClearStripeSubscription(ctx context.Context, licenseID, expectedSubID string) (bool, error) {
 	res, err := s.DB.NewRaw(
-		"UPDATE licenses SET stripe_subscription_id = NULL, updated_at = now() WHERE id = ? AND stripe_subscription_id = ?",
+		"UPDATE licenses SET stripe_subscription_id = NULL, stripe_pending_update_expires_at = NULL, terms_held_until = NULL, terms_check_after = NULL, updated_at = now() WHERE id = ? AND stripe_subscription_id = ?",
 		licenseID, expectedSubID,
 	).Exec(ctx)
 	if err != nil {

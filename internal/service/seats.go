@@ -83,10 +83,8 @@ func (s *SeatService) AddSeat(ctx context.Context, in AddSeatInput) (*model.Seat
 		return nil, apperr.BadRequest("cannot invite the license owner — they already have access")
 	}
 
-	maxSeats := 0
-	if lic.Plan != nil {
-		maxSeats = lic.Plan.MaxSeats
-	}
+	// The plan's seats, or on a plan sold per seat the seats bought.
+	maxSeats, _ := lic.Limits()
 
 	// Mint the invite token BEFORE we hand the seat to the store.
 	// The plain token only leaves this function inside the email
@@ -110,6 +108,10 @@ func (s *SeatService) AddSeat(ctx context.Context, in AddSeatInput) (*model.Seat
 	// restore-on-reinvite case (removed_at IS NOT NULL → un-remove).
 	outcome, err := s.store.AddSeatWithinLimit(ctx, seat, maxSeats)
 	if err != nil {
+		if errors.Is(err, store.ErrUpgradeCheckoutOpen) {
+			return nil, apperr.Conflict("UPGRADE_IN_PROGRESS",
+				"an upgrade of this license is waiting for payment; finish or close it before inviting people")
+		}
 		if errors.Is(err, store.ErrSeatLimitReached) {
 			// People on the license, the owner included, as max_seats
 			// counts them.

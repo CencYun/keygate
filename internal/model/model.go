@@ -274,14 +274,43 @@ type Plan struct {
 	SignupDailyCap    int    `bun:",notnull" json:"signup_daily_cap"`
 	SignupConsentText string `bun:",notnull" json:"signup_consent_text"`
 	// MaxSeats is how many people a license holds, the owner included:
-	// 5 is the owner and four members. 0 = no limit.
-	MaxSeats  int       `bun:",notnull" json:"max_seats"`
-	Active    bool      `bun:",notnull,default:true" json:"active"`
-	SortOrder int       `bun:",default:0" json:"sort_order"`
-	CreatedAt time.Time `bun:",nullzero,default:now()" json:"created_at"`
+	// 5 is the owner and four members. 0 = no limit. A plan sold per
+	// seat does not use it (see Limits); it keeps 1 there, or 0 on a
+	// product without seats, so a replica that predates PerSeat holds
+	// its licences to the owner alone rather than to nobody's limit.
+	MaxSeats int `bun:",notnull" json:"max_seats"`
+	// PerSeat sells the plan by the seat: the buyer pays for a quantity
+	// between MinQuantity and MaxQuantity, and MaxActivations is per
+	// seat. Subscriptions only. A zero bound is never meant, so the
+	// column default stands in for it on insert.
+	PerSeat     bool      `bun:",notnull" json:"per_seat"`
+	MinQuantity int       `bun:",notnull,default:1" json:"min_quantity"`
+	MaxQuantity int       `bun:",notnull,default:100" json:"max_quantity"`
+	Active      bool      `bun:",notnull,default:true" json:"active"`
+	SortOrder   int       `bun:",default:0" json:"sort_order"`
+	CreatedAt   time.Time `bun:",nullzero,default:now()" json:"created_at"`
 
 	Product      *Product       `bun:"rel:belongs-to,join:product_id=id" json:"product,omitempty"`
 	Entitlements []*Entitlement `bun:"rel:has-many,join:id=plan_id" json:"entitlements,omitempty"`
+}
+
+// MaxPlanQuantity is the most seats a per-seat plan may sell.
+const MaxPlanQuantity = 10000
+
+// Limits are how many people and how many devices (or floating
+// sessions) a licence on this plan holds when it is paid for quantity
+// seats. On a plan sold per seat the people are the seats and the
+// devices are MaxActivations for each; on any other plan they are the
+// plan's own, whatever the quantity. 0 seats means no limit, as on the
+// plan; 0 devices means none.
+func (p *Plan) Limits(quantity int) (seats, activations int) {
+	if !p.PerSeat {
+		return p.MaxSeats, p.MaxActivations
+	}
+	if quantity < 1 {
+		quantity = 1
+	}
+	return quantity, p.MaxActivations * quantity
 }
 
 // ─── Entitlement (feature flags per plan) ───
@@ -350,6 +379,17 @@ type License struct {
 	// license; fulfilment retries use it to see whether the session
 	// already produced one.
 	StripeCheckoutSessionID string `bun:",notnull,default:''" json:"stripe_checkout_session_id,omitempty"`
+	// Quantity is how many seats the license is paid for: for a Stripe
+	// subscription the quantity Stripe bills, read back from it (a
+	// downgrade writes it just ahead of Stripe, and puts it back if
+	// Stripe does not make it). Only a plan sold per seat turns it into
+	// limits (see Plan.Limits). Never 0, so the column default stands in
+	// for an unset one on insert.
+	Quantity int `bun:",notnull,default:1" json:"quantity"`
+	// StripePendingUpdateExpiresAt mirrors the subscription's
+	// pending_update: a change Stripe applies once its invoice is paid,
+	// and drops at this moment otherwise. Nil when nothing waits.
+	StripePendingUpdateExpiresAt *time.Time `bun:"stripe_pending_update_expires_at" json:"stripe_pending_update_expires_at,omitempty"`
 
 	Status     string     `bun:",notnull,default:'active'" json:"status"`
 	ValidFrom  time.Time  `bun:",notnull,default:now()" json:"valid_from"`
@@ -418,6 +458,35 @@ type License struct {
 	ActiveSessionCount int             `bun:"active_session_count,scanonly" json:"active_session_count"`
 	Seats              []*Seat         `bun:"rel:has-many,join:id=license_id" json:"seats,omitempty"`
 	Addons             []*LicenseAddon `bun:"rel:has-many,join:id=license_id" json:"addons,omitempty"`
+
+	// SeatLimit and ActivationLimit are what the licence holds, as
+	// Limits works them out; set by FillLimits wherever the plan is
+	// loaded, so clients show the limit the server enforces instead of
+	// working it out from the plan. Absent when the plan is not loaded.
+	SeatLimit       *int `bun:"-" json:"seat_limit,omitempty"`
+	ActivationLimit *int `bun:"-" json:"activation_limit,omitempty"`
+}
+
+// Limits are the people and devices this licence holds (see
+// Plan.Limits). Without its plan loaded it holds what a licence with no
+// plan always has: no seat limit and three devices.
+func (l *License) Limits() (seats, activations int) {
+	if l.Plan == nil {
+		return 0, 3
+	}
+	return l.Plan.Limits(l.Quantity)
+}
+
+// FillLimits sets SeatLimit and ActivationLimit on each licence whose
+// plan is loaded.
+func FillLimits(ls ...*License) {
+	for _, l := range ls {
+		if l == nil || l.Plan == nil {
+			continue
+		}
+		seats, activations := l.Plan.Limits(l.Quantity)
+		l.SeatLimit, l.ActivationLimit = &seats, &activations
+	}
 }
 
 const (
@@ -714,6 +783,7 @@ type LicenseUpgrade struct {
 	FromPaymentProvider     string     `bun:",notnull,default:''" json:"from_payment_provider,omitempty"`
 	FromStripeCustomerID    string     `bun:",notnull,default:''" json:"from_stripe_customer_id,omitempty"`
 	FromCanceledAt          *time.Time `json:"from_canceled_at,omitempty"`
+	FromQuantity            int        `bun:",notnull,default:1" json:"from_quantity"`
 	EndReason               string     `bun:",notnull,default:''" json:"end_reason,omitempty"`
 	CreatedAt               time.Time  `bun:",nullzero,default:now()" json:"created_at"`
 	AppliedAt               *time.Time `json:"applied_at,omitempty"`
@@ -880,6 +950,7 @@ const (
 	EventLicenseRevoked          = "license.revoked"
 	EventLicensePaymentFailed    = "license.payment_failed"
 	EventLicensePaymentRecovered = "license.payment_recovered"
+	EventLicenseQuantityChanged  = "license.quantity_changed"
 	EventQuotaWarning            = "quota.warning"
 	EventQuotaExceeded           = "quota.exceeded"
 	EventSeatAdded               = "seat.added"
@@ -899,8 +970,8 @@ var WebhookEvents = []string{
 	EventLicenseExpiryChanged, EventLicenseUpdatesChanged, EventLicenseExpired,
 	EventLicenseCanceled, EventLicenseSuspended, EventLicenseReinstated,
 	EventLicenseRevoked, EventLicensePaymentFailed, EventLicensePaymentRecovered,
-	EventQuotaWarning, EventQuotaExceeded, EventSeatAdded, EventSeatRemoved,
-	EventPlanChanged, EventReleasePublished, EventReleaseYanked, EventReleaseUnyanked,
+	EventLicenseQuantityChanged, EventQuotaWarning, EventQuotaExceeded,
+	EventSeatAdded, EventSeatRemoved, EventPlanChanged, EventReleasePublished, EventReleaseYanked, EventReleaseUnyanked,
 }
 
 // IsValidWebhookEvent reports whether e is in WebhookEvents.

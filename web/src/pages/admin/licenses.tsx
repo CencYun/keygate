@@ -62,7 +62,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { type TranslationKeys, useI18n } from "@/i18n"
-import { admin, type Plan } from "@/lib/api"
+import { admin, errorCode, type License, type Plan } from "@/lib/api"
 import { formatDate, maskKey, statusColor } from "@/lib/utils"
 
 // A date picked in the expiry field means "valid through that whole
@@ -262,7 +262,7 @@ export default function LicensesPage() {
                               lic.plan?.license_model === "floating"
                                 ? (lic.active_session_count ?? 0)
                                 : (lic.activation_count ?? 0)
-                            } / ${lic.plan?.max_activations || "-"}`}
+                            } / ${(lic.activation_limit ?? lic.plan?.max_activations) || "-"}`}
                       </DataTableCell>
                       <DataTableCell>
                         <Badge className={statusColor(lic.status)}>
@@ -654,6 +654,7 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                     <p className="text-muted-foreground">{t("common.plan")}</p>
                     <p className="mt-1 font-medium">{lic.plan?.name || "-"}</p>
                   </div>
+                  {lic.plan?.per_seat && <QuantityField license={lic} />}
                   <div>
                     <p className="text-muted-foreground">{t("licenses.validFrom")}</p>
                     <p className="mt-1">{formatDate(lic.valid_from)}</p>
@@ -986,8 +987,8 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                     <Separator />
                     <div>
                       <h3 className="font-semibold mb-3">
-                        {t("licenses.activations")} ({lic.activations?.length || 0} / {lic.plan?.max_activations || "-"}
-                        )
+                        {t("licenses.activations")} ({lic.activations?.length || 0} /{" "}
+                        {(lic.activation_limit ?? lic.plan?.max_activations) || "-"})
                       </h3>
                       {lic.activations && lic.activations.length > 0 ? (
                         <DataTable>
@@ -1066,7 +1067,7 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
             <TabsContent value="seats" className="-mr-6 min-h-0 flex-1 overflow-y-auto pr-6">
               <SeatsTab
                 licenseId={id}
-                maxSeats={lic?.plan?.max_seats || 0}
+                maxSeats={lic?.seat_limit ?? lic?.plan?.max_seats ?? 0}
                 hasSeats={lic?.product?.type === "saas" || lic?.product?.type === "hybrid"}
                 ownerEmail={lic?.email ?? ""}
               />
@@ -1423,5 +1424,91 @@ function ChangePlanDialog({
         </form>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// QuantityField shows the seats a license on a plan sold per seat holds.
+// A Stripe subscription's seats are Stripe's, changed by the customer in
+// the portal or in Stripe; any other license's are set here.
+function QuantityField({ license }: { license: License }) {
+  const { t } = useI18n()
+  const qc = useQueryClient()
+  const [editing, setEditing] = useState(false)
+  const [value, setValue] = useState(String(license.quantity ?? 1))
+  const n = Number(value)
+  const valid = Number.isInteger(n) && n >= 1 && n <= 10000
+  const saveMut = useMutation({
+    mutationFn: () => admin.setLicenseQuantity(license.id, n),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["admin", "license", license.id] })
+      qc.invalidateQueries({ queryKey: ["admin", "licenses"] })
+      setEditing(false)
+      showToast(t("licenses.quantitySaved"), "success")
+    },
+    meta: { ownErrors: true },
+    onError: (e: Error) => {
+      // Billed by Stripe, or moved off a plan sold per seat, meanwhile:
+      // the field shows the licence as it is now.
+      if (errorCode(e) === "STRIPE_MANAGED" || errorCode(e) === "NOT_PER_SEAT") {
+        qc.invalidateQueries({ queryKey: ["admin", "license", license.id] })
+        setEditing(false)
+      }
+      showToast(
+        errorCode(e) === "STRIPE_MANAGED"
+          ? t("licenses.quantityStripeManaged")
+          : errorCode(e) === "NOT_PER_SEAT"
+            ? t("licenses.quantityNotPerSeat")
+            : e.message,
+        "error",
+      )
+    },
+  })
+  const stripeManaged = !!license.stripe_subscription_id
+  return (
+    <div>
+      <p className="text-muted-foreground">{t("licenses.seatsBought")}</p>
+      {editing ? (
+        <div className="mt-1 flex items-center gap-2">
+          <Input
+            type="number"
+            min={1}
+            max={10000}
+            className="h-8 w-24"
+            aria-label={t("licenses.seatsBought")}
+            value={value}
+            autoFocus
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && valid && !saveMut.isPending) saveMut.mutate()
+            }}
+          />
+          <Button size="sm" className="h-8" disabled={!valid || saveMut.isPending} onClick={() => saveMut.mutate()}>
+            {t("common.save")}
+          </Button>
+          <Button size="sm" variant="ghost" className="h-8" onClick={() => setEditing(false)}>
+            {t("common.cancel")}
+          </Button>
+        </div>
+      ) : (
+        <div className="mt-1 flex items-center gap-2">
+          <span className="font-medium">{license.quantity ?? 1}</span>
+          {stripeManaged ? (
+            <span className="text-xs text-muted-foreground">{t("licenses.quantityStripe")}</span>
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 px-2 text-xs"
+              onClick={() => {
+                setValue(String(license.quantity ?? 1))
+                setEditing(true)
+              }}
+            >
+              {t("common.edit")}
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
   )
 }

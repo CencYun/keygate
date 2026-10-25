@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/uptrace/bun"
@@ -100,8 +101,23 @@ func UpdateProductIn(ctx context.Context, db bun.IDB, p *model.Product, cols ...
 	if len(cols) > 0 {
 		q = q.Column(cols...)
 	}
-	_, err := q.Exec(ctx)
-	return err
+	if _, err := q.Exec(ctx); err != nil {
+		return err
+	}
+	// A plan sold per seat keeps 1 in max_seats on a product with seats
+	// and 0 on one without (see model.Plan.MaxSeats); a new type moves
+	// it with the product.
+	if len(cols) == 0 || slices.Contains(cols, "type") {
+		seats := 0
+		if model.ProductSupports(p.Type, model.CapSeats) {
+			seats = 1
+		}
+		if _, err := db.NewRaw(`UPDATE plans SET max_seats = ? WHERE product_id = ? AND per_seat AND max_seats <> ?`,
+			seats, p.ID, seats).Exec(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // DeleteProduct removes the product and the rows the 20260515 bundle
@@ -262,12 +278,14 @@ func (s *Store) CountPlansIncompatibleWithType(ctx context.Context, productID, n
 	}
 	q := s.DB.NewSelect().Model((*model.Plan)(nil)).Where("product_id = ?", productID)
 	switch {
+	// A plan sold per seat sets no max_seats of its own: the 1 it keeps
+	// there moves with the product's type (see UpdateProductIn).
 	case !supportsAct && !supportsSeats:
-		q = q.Where("max_activations > 0 OR license_model = 'floating' OR max_seats > 0")
+		q = q.Where("max_activations > 0 OR license_model = 'floating' OR (max_seats > 0 AND NOT per_seat)")
 	case !supportsAct:
 		q = q.Where("max_activations > 0 OR license_model = 'floating'")
 	case !supportsSeats:
-		q = q.Where("max_seats > 0")
+		q = q.Where("max_seats > 0 AND NOT per_seat")
 	}
 	return q.Count(ctx)
 }
@@ -552,6 +570,44 @@ func (s *Store) SetLicenseValidUntil(ctx context.Context, id string, validUntil 
 		return syncSubscriptionStatus(ctx, tx, id, status)
 	})
 	return prev, status, err
+}
+
+// ErrQuantityStripeManaged: the licence is billed by a Stripe
+// subscription, whose quantity is the one it holds.
+var ErrQuantityStripeManaged = errors.New("the quantity of a Stripe-billed license is its subscription's")
+
+// ErrQuantityNotPerSeat: the licence's plan is not sold per seat, so a
+// quantity would change nothing it holds.
+var ErrQuantityNotPerSeat = errors.New("the license's plan is not sold per seat")
+
+// SetLicenseQuantity sets how many seats a licence nothing bills holds
+// (an offline sale, say) and returns what it had. The licence row is
+// locked for the decision, so a Stripe subscription linked meanwhile
+// is seen, and refused: its quantity comes from Stripe alone.
+func (s *Store) SetLicenseQuantity(ctx context.Context, id string, quantity int) (prev int, err error) {
+	err = RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		var row struct {
+			Quantity     int            `bun:"quantity"`
+			Subscription sql.NullString `bun:"stripe_subscription_id"`
+			PerSeat      sql.NullBool   `bun:"per_seat"`
+		}
+		if err := tx.NewRaw(`
+			SELECT l.quantity, l.stripe_subscription_id, p.per_seat FROM licenses l
+			LEFT JOIN plans p ON p.id = l.plan_id
+			WHERE l.id = ? FOR UPDATE OF l`, id).Scan(ctx, &row); err != nil {
+			return err
+		}
+		if row.Subscription.String != "" {
+			return ErrQuantityStripeManaged
+		}
+		if !row.PerSeat.Bool {
+			return ErrQuantityNotPerSeat
+		}
+		prev = row.Quantity
+		_, err := tx.NewRaw(`UPDATE licenses SET quantity = ?, updated_at = now() WHERE id = ?`, quantity, id).Exec(ctx)
+		return err
+	})
+	return prev, err
 }
 
 // ExpireLicenseIf marks a licence expired only while it still qualifies:

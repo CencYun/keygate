@@ -12,6 +12,11 @@ export function errorCode(err: unknown): string | undefined {
   return (err as { code?: string } | null)?.code
 }
 
+// errorDetails reads the details the server attached to an error, if any.
+export function errorDetails(err: unknown): Record<string, unknown> | undefined {
+  return (err as { details?: Record<string, unknown> } | null)?.details
+}
+
 type RefreshOutcome = "ok" | "denied" | "unavailable"
 
 // The session cookie lives 24 hours; the refresh cookie 30 days. When a
@@ -104,7 +109,10 @@ async function request<T>(path: string, opts?: RequestInit, retried = false): Pr
     // failing. Callers that decide "signed in or not" must tell it apart.
     // The server's error code rides along for callers that translate it.
     const err = res.status === 429 || res.status >= 500 ? new ServiceUnavailableError(msg) : new Error(msg)
-    throw Object.assign(err, { code: typeof json?.error?.code === "string" ? json.error.code : undefined })
+    throw Object.assign(err, {
+      code: typeof json?.error?.code === "string" ? json.error.code : undefined,
+      details: json?.error?.details && typeof json.error.details === "object" ? json.error.details : undefined,
+    })
   }
   return (json?.data !== undefined ? json.data : json) as T
 }
@@ -235,11 +243,21 @@ export const portal = {
   addSeat: (data: { license_key: string; email: string; role?: string }) => post<Seat>("/portal/seats/add", data),
   removeSeat: (data: { license_key: string; seat_id: string }) =>
     post<{ status: string }>("/portal/seats/remove", data),
-  changePlan: (data: { license_id: string; new_price_id: string }) =>
-    post<{ status: string; new_plan_id: string; new_plan_name: string; proration: string }>(
-      "/portal/subscription/change-plan",
-      data,
-    ),
+  // A change to the subscription's plan or seats: previewed, then made
+  // from the preview's signed token (its target, the terms it started
+  // from and its proration date).
+  previewChange: (data: { license_id: string; price_id?: string; quantity?: number }) =>
+    post<SubscriptionChangePreview>("/portal/subscription/preview", data),
+  changeSubscription: (data: { license_id: string; preview_token: string }) =>
+    post<SubscriptionChangeResult>("/portal/subscription/change", data),
+  pendingChange: (data: { license_id: string }) =>
+    post<{
+      status: "none" | "pending_payment"
+      hosted_invoice_url?: string
+      expires_at?: string
+      quantity?: number
+      plan_name?: string
+    }>("/portal/subscription/pending", data),
   cancelSubscription: (data: { license_id: string; immediate?: boolean }) =>
     post<{ status: string; immediate: boolean }>("/portal/subscription/cancel", data),
   getBillingPortal: (data: { license_id: string }) =>
@@ -250,6 +268,49 @@ export const portal = {
   // Moves a licence Stripe doesn't bill (a free plan's) to a paid plan
   // through checkout; the licence keeps its key.
   upgrade: (data: { license_id: string; plan_id: string }) => post<{ url: string }>("/portal/licenses/upgrade", data),
+}
+
+export interface SubscriptionTerms {
+  plan_id: string
+  plan_name: string
+  price_id: string
+  per_seat: boolean
+  quantity: number
+  seat_limit: number
+  activation_limit: number
+}
+
+export interface SubscriptionChangePreview {
+  current: SubscriptionTerms
+  target: SubscriptionTerms
+  // The change itself in the smallest currency unit: charged now when
+  // positive, credited to the customer's balance when negative.
+  total: number
+  credit_balance: number
+  due_now: number
+  currency: string
+  proration_date: number
+  seats_in_use: number
+  devices_in_use: number
+  replaces_pending: boolean
+  // A downgrade (it lowers a limit) applies now and is not prorated:
+  // nothing is charged or credited today, and the next invoice, due at
+  // next_invoice_at (unix seconds), bills next_invoice_total.
+  downgrade: boolean
+  next_invoice_total?: number
+  next_invoice_at?: number
+  preview_token: string
+}
+
+export interface SubscriptionChangeResult {
+  status: "applied" | "pending_payment" | "processing"
+  plan_id: string
+  plan_name: string
+  quantity: number
+  hosted_invoice_url?: string
+  expires_at?: string
+  downgrade?: boolean
+  keep?: boolean
 }
 
 // ─── Admin ───
@@ -488,6 +549,7 @@ export const admin = {
   // has the subscription.
   unlinkStripeSubscription: (id: string) => post<{ status: string }>(`/admin/licenses/${id}/stripe/unlink`, {}),
   changeLicensePlan: (id: string, data: { plan_id: string }) => post(`/admin/licenses/${id}/change-plan`, data),
+  setLicenseQuantity: (id: string, quantity: number) => post<License>(`/admin/licenses/${id}/quantity`, { quantity }),
 
   // Addons
   listAddons: (params?: { product_id?: string; search?: string; limit?: number; offset?: number }) =>
@@ -684,6 +746,11 @@ export interface Plan {
   signup_daily_cap?: number
   signup_consent_text?: string
   max_seats: number
+  // Sold per seat (subscriptions only): the buyer picks a quantity in
+  // [min_quantity, max_quantity]; max_activations is per seat.
+  per_seat?: boolean
+  min_quantity?: number
+  max_quantity?: number
   trial_days: number
   grace_days: number
   stripe_price_id?: string
@@ -739,6 +806,15 @@ export interface License {
   signup_source?: string
   marketing_consent?: boolean
   marketing_consent_at?: string
+  // Seats the licence is paid for; only a plan sold per seat turns it
+  // into limits.
+  quantity?: number
+  // The limits the server enforces (people, devices or floating
+  // sessions); 0 seats means no limit. Present when the plan is loaded.
+  seat_limit?: number
+  activation_limit?: number
+  // A subscription change waits for payment until this moment.
+  stripe_pending_update_expires_at?: string
   created_at: string
   updated_at: string
   product?: Product

@@ -25,6 +25,8 @@ import { type TranslationKeys, useI18n } from "@/i18n"
 import {
   type Activation,
   type Entitlement,
+  errorCode,
+  errorDetails,
   type Invoice,
   type Plan,
   type PortalLicense,
@@ -32,12 +34,16 @@ import {
   type Seat,
 } from "@/lib/api"
 import { cn, formatDate, statusColor } from "@/lib/utils"
+import { PendingChangeNotice, SubscriptionChangeDialog } from "./subscription-change"
 
 export default function PortalLicensesPage() {
   const { t } = useI18n()
   const { data, isLoading } = useQuery({
     queryKey: ["portal", "licenses"],
     queryFn: portal.licenses,
+    // Coming back from Stripe's page in another tab, show what was paid,
+    // however recently the list was read.
+    refetchOnWindowFocus: "always",
   })
 
   const licenses = data?.licenses || []
@@ -93,19 +99,24 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
   const [copied, setCopied] = useState(false)
   const [showInvoices, setShowInvoices] = useState(false)
   const [showChangePlan, setShowChangePlan] = useState(false)
+  const [showChangeSeats, setShowChangeSeats] = useState(false)
   const [showUpgrade, setShowUpgrade] = useState(false)
   const [showCancel, setShowCancel] = useState(false)
   const productType = lic.product?.type || "perpetual"
   const showUsage = productType === "saas" || productType === "hybrid"
   // Seats UI shows for any plan that *could* have more than one person.
-  // max_seats counts the owner and 0 means "no limit", so max_seats=1
-  // is a single-seat license, hidden unless it somehow has members
-  // already (the owner must still be able to see and remove them).
+  // The seat limit counts the owner and 0 means "no limit", so 1 is a
+  // single-seat license, hidden unless it somehow has members already
+  // (the owner must still be able to see and remove them). A plan sold
+  // per seat always shows it: buying more seats is how it grows.
   // Perpetual products don't have a portal-managed team, so gate on
-  // product type too.
-  const seatCap = lic.plan?.max_seats ?? 0
+  // product type too. The limit is the server's: on a plan sold per
+  // seat it is the seats bought, not the plan's max_seats.
+  const seatCap = lic.seat_limit ?? lic.plan?.max_seats ?? 0
+  const activationCap = lic.activation_limit ?? lic.plan?.max_activations ?? 0
+  const perSeat = !!lic.plan?.per_seat
   const hasMembers = (lic.seats ?? []).some((s) => !s.removed_at && s.email.toLowerCase() !== lic.email?.toLowerCase())
-  const showSeats = (productType === "saas" || productType === "hybrid") && (seatCap !== 1 || hasMembers)
+  const showSeats = (productType === "saas" || productType === "hybrid") && (seatCap !== 1 || hasMembers || perSeat)
 
   const copyKey = () => {
     navigator.clipboard.writeText(lic.license_key)
@@ -117,6 +128,14 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
   // subscription. A one-time purchase has none: the backend answers 400
   // to each, so don't offer them.
   const hasSubscription = lic.payment_provider === "stripe" && !!lic.stripe_subscription_id
+  // Seats bought through Stripe are changed in the portal by the owner.
+  // A plan sold in one fixed number of seats has nothing to change.
+  const canChangeSeats =
+    isOwner &&
+    hasSubscription &&
+    perSeat &&
+    (lic.plan?.min_quantity ?? 1) < (lic.plan?.max_quantity ?? 100) &&
+    (lic.status === "active" || lic.status === "trialing")
   // A licence on a free plan upgrades through a checkout and keeps its
   // key. The server says whether this one can (Stripe configured, a free
   // plan, not suspended or revoked, and a paid plan to move to).
@@ -199,16 +218,28 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
           <div>
             <p className="text-muted-foreground">{t("licenses.activations")}</p>
             <p className="font-medium">
-              {lic.activations?.length || 0} / {lic.plan?.max_activations || "-"}
+              {lic.activations?.length || 0} / {activationCap || "-"}
             </p>
           </div>
           {showSeats && (
             <div>
               <p className="text-muted-foreground">{t("licenses.seats")}</p>
-              <p className="font-medium">{seatCap === 0 ? t("common.unlimited") : seatCap}</p>
+              <p className="font-medium">
+                {seatCap === 0
+                  ? t("common.unlimited")
+                  : `${(lic.seats ?? []).filter((s) => !s.removed_at && s.email.toLowerCase() !== lic.email?.toLowerCase()).length + 1} / ${seatCap}`}
+              </p>
+            </div>
+          )}
+          {perSeat && !showSeats && (
+            <div>
+              <p className="text-muted-foreground">{t("portal.seatsBought")}</p>
+              <p className="font-medium">{lic.quantity ?? 1}</p>
             </div>
           )}
         </div>
+
+        {isOwner && <PendingChangeNotice license={lic} />}
 
         {/* Maintenance period */}
         {isPerpetualPlan && (
@@ -252,6 +283,11 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
                 {t("portal.updatePayment")}
               </Button>
             )}
+            {canChangeSeats && (
+              <Button variant="outline" size="sm" onClick={() => setShowChangeSeats(true)}>
+                {t("portal.changeSeats")}
+              </Button>
+            )}
             {hasSubscription && (lic.status === "active" || lic.status === "trialing") && (
               <>
                 <Button variant="outline" size="sm" onClick={() => setShowChangePlan(true)}>
@@ -292,7 +328,15 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
 
           {showSeats && (
             <TabsContent value="seats" className="mt-4">
-              <SeatsSection license={lic} />
+              {/* More seats only where the plan sells more than the licence has. */}
+              <SeatsSection
+                license={lic}
+                onAddSeats={
+                  canChangeSeats && (lic.quantity ?? 1) < (lic.plan?.max_quantity ?? 100)
+                    ? () => setShowChangeSeats(true)
+                    : undefined
+                }
+              />
             </TabsContent>
           )}
         </Tabs>
@@ -309,6 +353,9 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
         {showInvoices && <InvoicesDialog licenseId={lic.id} onClose={() => setShowInvoices(false)} />}
 
         {showChangePlan && <ChangePlanDialog license={lic} onClose={() => setShowChangePlan(false)} />}
+        {showChangeSeats && lic.plan && (
+          <SubscriptionChangeDialog license={lic} target={lic.plan} onClose={() => setShowChangeSeats(false)} />
+        )}
         {showUpgrade && <UpgradeDialog license={lic} onClose={() => setShowUpgrade(false)} />}
       </CardContent>
     </Card>
@@ -377,7 +424,10 @@ function ActivationsSection({ license }: { license: PortalLicense }) {
       <div className="space-y-3">
         <p className="text-sm font-medium">
           {t("portal.activeDevices")} ({embedded.length}
-          {license.plan?.max_activations ? `/${license.plan.max_activations}` : ""})
+          {(license.activation_limit ?? license.plan?.max_activations)
+            ? `/${license.activation_limit ?? license.plan?.max_activations}`
+            : ""}
+          )
         </p>
         {embedded.length === 0 ? (
           <p className="text-sm text-muted-foreground py-4 text-center">{t("portal.noDevices")}</p>
@@ -503,7 +553,7 @@ function EntitlementsSection({ entitlements }: { entitlements: Entitlement[] }) 
   )
 }
 
-function SeatsSection({ license }: { license: PortalLicense }) {
+function SeatsSection({ license, onAddSeats }: { license: PortalLicense; onAddSeats?: () => void }) {
   const { t } = useI18n()
   const { user } = useAuth()
   const qc = useQueryClient()
@@ -541,7 +591,8 @@ function SeatsSection({ license }: { license: PortalLicense }) {
   // without a row, as max_seats counts them on the server.
   const activeCount = members.filter((s) => !s.removed_at).length + 1
   // maxSeats=0 means "no limit"; never gate the Add button in that case.
-  const maxSeats = license.plan?.max_seats ?? 0
+  // The server's limit: the seats bought, on a plan sold per seat.
+  const maxSeats = license.seat_limit ?? license.plan?.max_seats ?? 0
   const atLimit = maxSeats > 0 && activeCount >= maxSeats
 
   // canManage mirrors backend portalSeatMutationGuard: the license
@@ -568,7 +619,26 @@ function SeatsSection({ license }: { license: PortalLicense }) {
         )}
       </div>
 
-      {canManage && atLimit && <p className="text-xs text-muted-foreground">{t("portal.seatLimit")}</p>}
+      {canManage && atLimit && (
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <p className="text-xs text-muted-foreground">
+            {onAddSeats
+              ? t("portal.seatLimitBuyMore")
+              : !license.plan?.per_seat
+                ? t("portal.seatLimit")
+                : !isLicenseOwner
+                  ? t("portal.seatLimitAskOwner")
+                  : license.stripe_subscription_id && license.status === "past_due"
+                    ? t("portal.seatLimitSettleFirst")
+                    : t("portal.seatLimitFull")}
+          </p>
+          {onAddSeats && (
+            <Button size="sm" variant="outline" onClick={onAddSeats}>
+              {t("portal.addSeats")}
+            </Button>
+          )}
+        </div>
+      )}
 
       {seatsQuery.isLoading ? (
         <div className="h-16 animate-pulse bg-muted rounded-lg" />
@@ -683,7 +753,19 @@ function InviteSeatDialog({ license, onClose }: { license: PortalLicense; onClos
       qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
       onClose()
     },
-    onError: (e: Error) => showToast(e.message, "error"),
+    meta: { ownErrors: true },
+    onError: (e: Error) => {
+      // Full: the card behind is read again, so it shows the seats as they are.
+      if (errorCode(e) === "SEAT_LIMIT") qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
+      showToast(
+        errorCode(e) === "UPGRADE_IN_PROGRESS"
+          ? t("portal.inviteDuringUpgrade")
+          : errorCode(e) === "SEAT_LIMIT"
+            ? t("portal.inviteSeatLimit")
+            : e.message,
+        "error",
+      )
+    },
   })
 
   const trimmed = email.trim()
@@ -955,7 +1037,15 @@ function UpgradeDialog({ license, onClose }: { license: PortalLicense; onClose: 
       const res = await portal.upgrade({ license_id: license.id, plan_id: plan.id })
       window.location.href = res.url
     } catch (err) {
-      showToast(err instanceof Error ? err.message : "An error occurred", "error")
+      const d = errorDetails(err)
+      showToast(
+        errorCode(err) === "SEATS_IN_USE"
+          ? t("portal.upgradeTooManyPeople", { people: Number(d?.in_use ?? 0), max: Number(d?.seat_limit ?? 0) })
+          : err instanceof Error
+            ? err.message
+            : "An error occurred",
+        "error",
+      )
       setStarting("")
     }
   }
@@ -981,6 +1071,7 @@ function UpgradeDialog({ license, onClose }: { license: PortalLicense; onClose: 
                     <p className="text-xs text-muted-foreground">
                       {plan.license_type}
                       {plan.billing_interval ? ` · ${plan.billing_interval}` : ""}
+                      {plan.per_seat ? ` · ${t("portal.perSeatChooseAtCheckout")}` : ""}
                     </p>
                   </div>
                   <Button size="sm" onClick={() => start(plan)} disabled={starting !== ""}>
@@ -998,7 +1089,6 @@ function UpgradeDialog({ license, onClose }: { license: PortalLicense; onClose: 
 
 function ChangePlanDialog({ license, onClose }: { license: PortalLicense; onClose: () => void }) {
   const { t } = useI18n()
-  const qc = useQueryClient()
 
   // Fetch available plans via portal API (not admin)
   const { data: plansData } = useQuery({
@@ -1007,26 +1097,29 @@ function ChangePlanDialog({ license, onClose }: { license: PortalLicense; onClos
   })
   // Only other subscription plans with a Stripe price: a subscription
   // can move between prices, not become a one-time purchase. Mirrors
-  // the backend's change-plan gate.
+  // the backend's change-plan gate. With a change waiting for payment,
+  // the current plan is offered too: choosing it drops that change.
+  const waiting =
+    !!license.stripe_pending_update_expires_at && new Date(license.stripe_pending_update_expires_at) > new Date()
   const plans = (plansData?.plans || []).filter(
-    (p: Plan) => p.id !== license.plan_id && p.license_type === "subscription" && p.stripe_price_id,
+    (p: Plan) => (p.id !== license.plan_id || waiting) && p.license_type === "subscription" && p.stripe_price_id,
   )
 
-  // Switching bills the customer at once (prorated), so it is
-  // confirmed first and acknowledged after.
-  const [confirming, setConfirming] = useState<Plan | null>(null)
-  const changeMut = useMutation({
-    mutationFn: (plan: Plan) => portal.changePlan({ license_id: license.id, new_price_id: plan.stripe_price_id || "" }),
-    onSuccess: (_, plan) => {
-      qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
-      showToast(t("portal.planChanged", { plan: plan.name }), "success")
-      onClose()
-    },
-    onError: (e: Error) => {
-      setConfirming(null)
-      showToast(e.message, "error")
-    },
-  })
+  // Picking a plan opens the change itself: seats for a plan sold per
+  // seat, then Stripe's price for the switch, confirmed before anything
+  // changes.
+  const [chosen, setChosen] = useState<Plan | null>(null)
+  if (chosen) {
+    return (
+      <SubscriptionChangeDialog
+        license={license}
+        target={chosen}
+        keep={chosen.id === license.plan_id}
+        onClose={onClose}
+        onBack={() => setChosen(null)}
+      />
+    )
+  }
 
   return (
     <Dialog open onOpenChange={onClose}>
@@ -1043,37 +1136,26 @@ function ChangePlanDialog({ license, onClose }: { license: PortalLicense; onClos
               {plans.map((plan: Plan) => (
                 <div key={plan.id} className="flex items-center justify-between bg-muted/50 rounded-lg px-4 py-3">
                   <div>
-                    <p className="font-medium text-sm">{plan.name}</p>
+                    <p className="font-medium text-sm">
+                      {plan.name}
+                      {plan.id === license.plan_id && (
+                        <span className="text-muted-foreground font-normal"> · {t("portal.currentPlan")}</span>
+                      )}
+                    </p>
                     <p className="text-xs text-muted-foreground">
                       {plan.license_type}
                       {plan.billing_interval ? ` · ${plan.billing_interval}` : ""}
+                      {plan.per_seat ? ` · ${t("portal.perSeat")}` : ""}
                     </p>
                   </div>
-                  <Button size="sm" onClick={() => setConfirming(plan)} disabled={changeMut.isPending}>
-                    {t("portal.switchTo")}
+                  <Button size="sm" onClick={() => setChosen(plan)}>
+                    {plan.id === license.plan_id ? t("portal.keepPlan") : t("portal.switchTo")}
                   </Button>
                 </div>
               ))}
             </div>
           )}
         </DialogBody>
-        <AlertDialog
-          open={confirming !== null}
-          onOpenChange={(open) => !open && !changeMut.isPending && setConfirming(null)}
-        >
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>{t("portal.confirmSwitchTitle", { plan: confirming?.name ?? "" })}</AlertDialogTitle>
-              <AlertDialogDescription>{t("portal.confirmSwitchDesc")}</AlertDialogDescription>
-            </AlertDialogHeader>
-            <div className="flex justify-end gap-2">
-              <AlertDialogCancel disabled={changeMut.isPending}>{t("common.cancel")}</AlertDialogCancel>
-              <Button onClick={() => confirming && changeMut.mutate(confirming)} disabled={changeMut.isPending}>
-                {changeMut.isPending ? t("common.loading") : t("portal.confirmSwitch")}
-              </Button>
-            </div>
-          </AlertDialogContent>
-        </AlertDialog>
       </DialogContent>
     </Dialog>
   )

@@ -174,13 +174,15 @@ func (h *PortalActivationsHandler) Delete(c *gin.Context) {
 }
 
 // maxActivationsForLicense returns the activation cap for a license
-// (driven by the plan's max_activations). Used for UI hints like
-// "2 / 3 devices in use".
+// (the plan's max_activations, per seat on a plan sold that way). Used
+// for UI hints like "2 / 3 devices in use"; 0 when there is no plan to
+// say.
 func maxActivationsForLicense(lic *model.License) int {
-	if lic.Plan != nil && lic.Plan.MaxActivations > 0 {
-		return lic.Plan.MaxActivations
+	if lic.Plan == nil {
+		return 0
 	}
-	return 0
+	_, activations := lic.Limits()
+	return activations
 }
 
 func emailFromContext(c *gin.Context) string {

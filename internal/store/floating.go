@@ -50,11 +50,15 @@ func (s *Store) CheckOutFloatingWithLimit(ctx context.Context, sess *model.Float
 	// FOR UPDATE on floating_sessions locks nothing when there are no
 	// rows yet, which would let two first-ever checkouts both pass the
 	// count and exceed the limit.
-	_, err = tx.NewRaw(`
-		SELECT id FROM licenses WHERE id = ? FOR UPDATE
-	`, sess.LicenseID).Exec(ctx)
+	//
+	// The limit is the one the licence has under the lock: its seats
+	// may have gone down since the caller read it.
+	_, held, known, err := lockLicenseLimitsIn(ctx, tx, sess.LicenseID)
 	if err != nil {
 		return false, err
+	}
+	if known {
+		maxSessions = min(maxSessions, held)
 	}
 
 	// This machine may already be holding a running lease, in which

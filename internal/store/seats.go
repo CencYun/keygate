@@ -7,9 +7,11 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"hash/fnv"
 	"time"
 
 	"github.com/tabloy/keygate/internal/model"
+	"github.com/uptrace/bun"
 )
 
 // SeatInviteTTL is how long a freshly-minted invite token stays
@@ -41,6 +43,31 @@ func GenerateSeatInviteToken() (plain, hash string) {
 func HashSeatInviteToken(plain string) string {
 	h := sha256.Sum256([]byte(plain))
 	return hex.EncodeToString(h[:])
+}
+
+// ErrUpgradeCheckoutOpen is returned by AddSeatWithinLimit while a
+// checkout for upgrading the licence to a plan sold per seat is open:
+// its seats were counted from the people on the licence when it opened,
+// so nobody joins until it is paid or closed.
+var ErrUpgradeCheckoutOpen = errors.New("an upgrade checkout is open")
+
+// PerSeatUpgradeCheckoutTTL is how long a checkout upgrading a licence
+// to a plan sold per seat can be paid (its expires_at); an abandoned one
+// holds invites up no longer. upgradeCheckoutOpenFor adds a margin for
+// the moments between the upgrade row and the checkout being created.
+const (
+	PerSeatUpgradeCheckoutTTL = time.Hour
+	upgradeCheckoutOpenFor    = PerSeatUpgradeCheckoutTTL + 5*time.Minute
+)
+
+// UpgradeLockKey names the advisory lock StartUpgrade holds per licence
+// while it opens a checkout, so two clicks cannot both open one. An
+// invite waits for it (see AddSeatWithinLimit): the checkout's seats
+// are counted under it, and its upgrade is seen once it is open.
+func UpgradeLockKey(licenseID string) int64 {
+	hash := fnv.New64a()
+	hash.Write([]byte("upgrade:" + licenseID))
+	return int64(hash.Sum64())
 }
 
 // ErrSeatLimitReached is returned by AddSeatWithinLimit when the
@@ -94,10 +121,22 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// Lock the parent license row so concurrent /seats/add for the
-	// same license serialize through this critical section.
-	if _, err := tx.NewRaw("SELECT id FROM licenses WHERE id = ? FOR UPDATE", seat.LicenseID).Exec(ctx); err != nil {
+	// An upgrade checkout being opened counts the people first; the
+	// invite waits for it to be open, and is then held up by it.
+	if _, err := tx.NewRaw("SELECT pg_advisory_xact_lock_shared(?)", UpgradeLockKey(seat.LicenseID)).Exec(ctx); err != nil {
 		return "", err
+	}
+
+	// Lock the parent license row so concurrent /seats/add for the
+	// same license serialize through this critical section, and hold
+	// the invite to the seats the licence has now (see
+	// lockLicenseLimitsIn).
+	held, _, known, err := lockLicenseLimitsIn(ctx, tx, seat.LicenseID)
+	if err != nil {
+		return "", err
+	}
+	if known {
+		maxSeats = stricterSeatLimit(maxSeats, held)
 	}
 
 	// Existing live seat? Two sub-cases:
@@ -138,6 +177,18 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
+	}
+
+	// Someone joining, not an invite sent again: not while a checkout
+	// for a plan sold per seat is open (see ErrUpgradeCheckoutOpen).
+	var upgrading bool
+	if err := tx.NewRaw(`SELECT EXISTS (SELECT 1 FROM license_upgrades u JOIN plans p ON p.id = u.to_plan_id
+		WHERE u.license_id = ? AND u.state = ? AND p.per_seat AND u.created_at > now() - make_interval(secs => ?))`,
+		seat.LicenseID, model.UpgradePending, upgradeCheckoutOpenFor.Seconds()).Scan(ctx, &upgrading); err != nil {
+		return "", err
+	}
+	if upgrading {
+		return "", ErrUpgradeCheckoutOpen
 	}
 
 	// Capacity check — the members (see memberSeatsSQL), plus one for
@@ -383,8 +434,13 @@ func (s *Store) CountLicensesOverSeatLimit(ctx context.Context, planID string, m
 // CountActiveSeats returns how many members a license has, the owner
 // not included (see memberSeatsSQL).
 func (s *Store) CountActiveSeats(ctx context.Context, licenseID string) (int, error) {
+	return CountActiveSeatsIn(ctx, s.DB, licenseID)
+}
+
+// CountActiveSeatsIn is CountActiveSeats on a caller's transaction.
+func CountActiveSeatsIn(ctx context.Context, db bun.IDB, licenseID string) (int, error) {
 	var n int
-	err := s.DB.NewRaw(memberSeatsSQL, licenseID).Scan(ctx, &n)
+	err := db.NewRaw(memberSeatsSQL, licenseID).Scan(ctx, &n)
 	return n, err
 }
 

@@ -53,7 +53,9 @@ func (s *FloatingService) CheckOut(ctx context.Context, in CheckOutInput) (*Chec
 	if timeout <= 0 {
 		timeout = 30
 	}
-	maxSessions := lic.Plan.MaxActivations
+	// Floating sessions are counted against the device limit: per seat
+	// on a plan sold that way.
+	_, maxSessions := lic.Limits()
 
 	expiresAt := time.Now().Add(time.Duration(timeout) * time.Minute)
 	sess := &model.FloatingSession{
@@ -105,13 +107,10 @@ func (s *FloatingService) Heartbeat(ctx context.Context, licenseKey, identifier,
 	}
 
 	timeout := 30
-	maxSessions := 3
-	if lic.Plan != nil {
-		if lic.Plan.FloatingTimeout > 0 {
-			timeout = lic.Plan.FloatingTimeout
-		}
-		maxSessions = lic.Plan.MaxActivations
+	if lic.Plan != nil && lic.Plan.FloatingTimeout > 0 {
+		timeout = lic.Plan.FloatingTimeout
 	}
+	_, maxSessions := lic.Limits()
 
 	newExpiry := time.Now().Add(time.Duration(timeout) * time.Minute)
 	// A heartbeat that renewed nothing is the answer, not a silent

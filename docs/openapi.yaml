@@ -328,8 +328,9 @@ paths:
 
         - Re-activating the same identifier returns `already_activated`
           without consuming an additional slot
-        - Atomic enforcement of the plan's `max_activations`
-          (concurrent retries can never exceed the cap)
+        - Atomic enforcement of the plan's `max_activations`, times the
+          seats bought on a plan sold per seat (concurrent retries can
+          never exceed the cap)
         - A license on a floating plan (`license_model: floating`) is
           refused with `409 FLOATING_LICENSE`: check out a session with
           `/license/floating/checkout` instead. That includes an
@@ -681,7 +682,7 @@ paths:
         refreshed via heartbeat.
 
         - Atomic: concurrent checkouts will never exceed the plan's
-          `max_activations`
+          `max_activations` (times the seats bought, on a plan sold per seat)
         - Re-checkout with the same identifier refreshes the existing session
         - `identifier` and `label` are trimmed first. A blank identifier,
           one longer than 256 bytes, or a label longer than 256
@@ -1259,6 +1260,15 @@ paths:
                             self_signup:
                               type: boolean
                               description: True for a free plan open to self sign-up (no Stripe price)
+                            per_seat:
+                              type: boolean
+                              description: Sold per seat; `price` is per seat
+                            min_quantity:
+                              type: integer
+                              description: Fewest seats a checkout sells; present on a per-seat plan
+                            max_quantity:
+                              type: integer
+                              description: Most seats a checkout sells; present on a per-seat plan
         "404":
           description: Unknown product slug (`NOT_FOUND`)
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -1288,15 +1298,26 @@ paths:
           `{BASE_URL}/pricing` on cancel.
         - A free plan with self sign-up on: 302 to the web form at
           `{BASE_URL}/signup/{checkout_id}`.
+
+        A subscription plan sold per seat (`per_seat`) sells a quantity:
+        the checkout starts at `quantity` (the plan's `min_quantity` when
+        left out) and the buyer can change it on Stripe's page between
+        `min_quantity` and `max_quantity`. The license holds what the
+        subscription bills.
       parameters:
         - $ref: "#/components/parameters/CheckoutID"
+        - name: quantity
+          in: query
+          required: false
+          description: Seats to start a per-seat plan's checkout with. Refused (400) out of the plan's range, or above 1 on a plan not sold per seat.
+          schema: { type: integer, minimum: 1 }
       responses:
         "302":
           description: Free self sign-up plan; redirect to the sign-up form
         "307":
           description: Redirect to Stripe Checkout
         "400":
-          description: "`invalid checkout id` (not 8 characters), plain text"
+          description: "`invalid checkout id` (not 8 characters), or a `quantity` the plan does not sell; plain text"
           content: { text/plain: { schema: { type: string } } }
         "404":
           description: "`plan not found`, plain text"
@@ -1903,6 +1924,16 @@ paths:
                             updates_days:
                               type: integer
                               description: Length of the update period the plan sells; 0 = none
+                            per_seat: { type: boolean }
+                            min_quantity: { type: integer }
+                            max_quantity: { type: integer }
+                            max_activations:
+                              type: integer
+                              description: Devices (or floating sessions) a license holds; per seat on a per-seat plan
+                            max_seats:
+                              type: integer
+                              description: People a license holds, the owner included (0 = no limit). A plan sold per seat holds the seats bought instead and keeps 1 here (0 on a product without people).
+                            license_model: { type: string, enum: [standard, floating] }
         "400":
           description: "`BAD_REQUEST`: `product_id` missing"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -2069,9 +2100,14 @@ paths:
         seat with no email re-send.
 
         Cannot invite the license owner's own email (400). Enforces
-        the plan's `max_seats`, which counts the owner: with
-        `max_seats: 5` the owner invites four members, and with 1 none
-        (409 SEAT_LIMIT, where `current` counts the owner too). When a seat is
+        the license's seat limit (`seat_limit` on the license: the
+        plan's `max_seats`, or the seats bought on a plan sold per seat),
+        which counts the owner: with 5 the owner invites four members,
+        and with 1 none
+        (409 SEAT_LIMIT, where `current` counts the owner too), and nobody
+        new is invited while a checkout upgrading the license to a plan sold
+        per seat is open, which lapses within an hour (409
+        UPGRADE_IN_PROGRESS). When a seat is
         added, an invite email goes to the recipient and the
         `seat.added` webhook fires; they accept via `/invites/accept`.
         The body is capped at 64 KiB.
@@ -2118,7 +2154,7 @@ paths:
           description: "`LICENSE_NOT_FOUND`: unknown or unusable license, a product without seats, or the caller lacks mutation rights"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "409":
-          description: "Seat limit reached (`SEAT_LIMIT`, `details: {max, current}`, both counting the owner)"
+          description: "`SEAT_LIMIT`: every seat is taken (`details: {max, current}`, both counting the owner). `UPGRADE_IN_PROGRESS`: a checkout upgrading the license to a plan sold per seat is open (it lapses within an hour)"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "413":
           $ref: "#/components/responses/PortalBodyTooLarge"
@@ -2213,7 +2249,7 @@ paths:
                             last_verified: { type: string, format: date-time }
                       max:
                         type: integer
-                        description: The plan's `max_activations`; 0 when the plan sets none
+                        description: The license's device limit (the plan's `max_activations`, times the seats bought on a plan sold per seat); 0 when there is none
         "401":
           $ref: "#/components/responses/SessionRequired"
         "404":
@@ -2259,15 +2295,26 @@ paths:
       tags: [Portal]
       summary: Move a subscription to another plan
       description: |
-        For the license owner (email match; a seat is not enough). Swaps
-        the Stripe subscription's price for `new_price_id`, always with
-        proration (`create_prorations`): the customer pays for the time
-        spent on each plan. The license moves to the plan that has that
-        Stripe price, and `plan.changed` fires.
+        For the license owner (email match; a seat is not enough). The
+        API form of `POST /portal/subscription/change` with no preview:
+        the subscription moves to the plan with `new_price_id` and keeps
+        its seats. A plan not sold per seat takes 1 coming from a plan
+        sold per seat, and otherwise keeps the quantity the subscription
+        has. It is charged the same way: a plan that lowers none of the
+        license's limits is invoiced at once and held until that invoice
+        is paid, so a dearer plan applies only once the difference is
+        paid (`pending_payment`) and a cheaper one applies at once with
+        the difference credited to the customer's Stripe balance; a plan
+        that lowers a limit is a downgrade, applied at once without
+        proration and billed from the next invoice.
 
-        The target must be an active subscription plan of the same
-        product. Checks run license and ownership first, so a wrong owner
-        cannot learn whether a price exists.
+        The license follows the subscription Stripe returns, and
+        `plan.changed` fires when its plan moves. Asking for the plan the
+        subscription already has answers `plan_changed` (a retry finds the
+        change made), and drops a change waiting for payment. The target must be an
+        active subscription plan of the same product, and the license
+        active or trialing. Checks run license and ownership first, so a
+        wrong owner cannot learn whether a price exists.
       security:
         - CookieAuth: []
       requestBody:
@@ -2284,7 +2331,7 @@ paths:
                   description: Stripe price id of the target plan (`stripe_price_id` from `GET /portal/plans`)
       responses:
         "200":
-          description: Plan changed
+          description: Plan changed, or waiting for payment
           content:
             application/json:
               schema:
@@ -2294,15 +2341,53 @@ paths:
                   data:
                     type: object
                     properties:
-                      status: { type: string, enum: [plan_changed] }
+                      status: { type: string, enum: [plan_changed, pending_payment] }
                       new_plan_id: { type: string, format: uuid }
                       new_plan_name: { type: string }
-                      proration: { type: string, enum: [create_prorations] }
+                      plan_id: { type: string, format: uuid, description: Same as new_plan_id }
+                      plan_name: { type: string, description: Same as new_plan_name }
+                      quantity: { type: integer }
+                      proration:
+                        type: string
+                        enum: [always_invoice, none]
+                        description: "`none` for a downgrade, billed from the next invoice"
+                      downgrade: { type: boolean, description: The change lowered a limit }
+                      hosted_invoice_url:
+                        type: string
+                        description: With `pending_payment`, Stripe's page to pay the invoice on
+                      expires_at:
+                        type: string
+                        format: date-time
+                        description: With `pending_payment`, when Stripe drops the change if still unpaid
+        "202":
+          description: |
+            Stripe gave no answer, even when asked again. The license
+            follows Stripe's next event; a downgrade has already moved it
+            to the lower terms, which it keeps against reads that still
+            show the old ones for up to 10 minutes, or until a read shows
+            the change.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      status: { type: string, enum: [processing] }
+                      new_plan_id: { type: string, format: uuid }
+                      new_plan_name: { type: string }
+                      plan_id: { type: string, format: uuid }
+                      plan_name: { type: string }
+                      quantity: { type: integer }
+                      proration: { type: string, enum: [always_invoice, none] }
+                      downgrade: { type: boolean }
         "400":
           description: |
             - `BAD_REQUEST`: missing fields, unknown `new_price_id`, no
               Stripe subscription on the license, or a plan of another
-              product
+              product.
             - `PLAN_INACTIVE`: the target plan is no longer available
             - `NOT_SUBSCRIPTION_PLAN`: the target is not a subscription plan
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -2314,8 +2399,276 @@ paths:
         "404":
           description: "`NOT_FOUND`: no such license"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          $ref: "#/components/responses/SubscriptionChangeRefused"
+        "429":
+          description: "`RATE_LIMITED`: too many requests from this IP, Stripe was busy reading the subscription, or too many changes are under way (`Retry-After` 60 for the first, 5 for the others)"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "500":
-          description: Stripe refused or could not be reached
+          description: Stripe could not be read
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: "`PAYMENTS_UNAVAILABLE`: Stripe is not configured"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /portal/subscription/preview:
+    post:
+      tags: [Portal]
+      summary: Preview a change to a subscription's plan or seats
+      description: |
+        For the license owner. Asks Stripe what the change would cost,
+        changing nothing in Stripe (a license found out of line with its
+        subscription is brought into line first, with the webhooks that
+        go with that). `price_id` empty keeps the plan;
+        `quantity` 0 keeps the seats. A plan not sold per seat takes no
+        quantity: it keeps the one the subscription has, or 1 coming from
+        a plan sold per seat.
+
+        A change that lowers a limit the product uses (fewer seats, fewer
+        devices) is a downgrade (`downgrade: true`): it applies at once
+        and is not prorated, so `total` and `due_now` are 0, nothing is
+        credited for the rest of the period, and `next_invoice_total` is
+        what the next invoice, due at `next_invoice_at`, bills on the new
+        terms. Any other change is prorated: `total` is the change itself,
+        for the rest of the billing period, charged at once when
+        positive, credited to the customer's Stripe balance when negative. Stripe's preview leaves the balance out,
+        so it is read from the customer: `credit_balance` is the credit
+        held, and `due_now` is `total` less that credit (or plus what the
+        customer owes). `total` includes tax and discounts. Asking for
+        what the subscription has now, while a change waits for payment,
+        previews dropping that change: it charges nothing, so any payment
+        method and collection setting can do it, whatever range the plan
+        sells now.
+        To make the change, pass `preview_token` to
+        `POST /portal/subscription/change`: it carries the target, the
+        terms the preview started from and its proration date, signed by
+        the server. Rate limited per IP (30 per minute, shared with
+        change, pending and change-plan).
+      security:
+        - CookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionChangeRequest"
+      responses:
+        "200":
+          description: What the change would cost
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      current: { $ref: "#/components/schemas/SubscriptionTerms" }
+                      target: { $ref: "#/components/schemas/SubscriptionTerms" }
+                      total: { type: integer, format: int64, description: "Smallest currency unit; negative is a credit" }
+                      credit_balance: { type: integer, format: int64 }
+                      due_now: { type: integer, format: int64 }
+                      currency: { type: string }
+                      proration_date: { type: integer, format: int64, description: Unix seconds }
+                      seats_in_use: { type: integer, description: People on the license, the owner included }
+                      devices_in_use: { type: integer }
+                      replaces_pending:
+                        type: boolean
+                        description: A change waits for payment, and this one would replace it
+                      downgrade:
+                        type: boolean
+                        description: The change lowers a limit; it applies at once and is billed from the next invoice
+                      next_invoice_total:
+                        type: integer
+                        format: int64
+                        description: Downgrade only. What the next invoice bills on the new terms, smallest currency unit
+                      next_invoice_at:
+                        type: integer
+                        format: int64
+                        description: Downgrade only, and absent for a subscription set to end. When the next invoice falls due, Unix seconds
+                      preview_token:
+                        type: string
+                        description: Makes this change through `POST /portal/subscription/change`, for an hour
+        "400":
+          description: "`BAD_REQUEST`, `PLAN_INACTIVE` or `NOT_SUBSCRIPTION_PLAN`, as for change-plan"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401":
+          $ref: "#/components/responses/SessionRequired"
+        "403":
+          description: "`FORBIDDEN`: not the user's license"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "404":
+          description: "`NOT_FOUND`: no such license"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          $ref: "#/components/responses/SubscriptionChangeRefused"
+        "429":
+          description: "`RATE_LIMITED`: too many requests from this IP (`Retry-After` the limiter's window), or Stripe was busy (`Retry-After: 5`); try again shortly"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "500":
+          description: Stripe could not be read
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: "`PAYMENTS_UNAVAILABLE`: Stripe is not configured"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /portal/subscription/change:
+    post:
+      tags: [Portal]
+      summary: Change a subscription's plan or seats, as previewed
+      description: |
+        For the license owner. Makes the change a preview showed, from its
+        `preview_token`: the same target, charged from the preview's
+        proration date, so Stripe charges what was shown (a customer who
+        waits pays for the time waited). Refused when the token is over an
+        hour old, the subscription renewed since, or the change is no
+        longer the kind the preview showed (`PREVIEW_EXPIRED`), altered
+        (400), or the subscription no longer has the price and quantity
+        the preview started from (`SUBSCRIPTION_CHANGED`). A downgrade
+        applies at once and is not prorated (`proration_behavior=none`);
+        any other change is invoiced at once and held until paid
+        (`payment_behavior=pending_if_incomplete`):
+
+        - `applied`: Stripe made it (a downgrade, paid, covered by the
+          customer's balance, or a credit). The license already shows it.
+        - `pending_payment`: the invoice was not paid (a declined card,
+          or the bank wants the customer to confirm). Nothing changes
+          until it is paid at `hosted_invoice_url`; at `expires_at`
+          Stripe drops it. A new change replaces it.
+        - `processing` (202): Stripe gave no answer, even when asked again.
+          The license follows Stripe's next event; a downgrade has already
+          moved it to the lower terms, which it keeps against reads that
+          still show the old ones for up to 10 minutes, or until a read
+          shows the change (after that, looking at the current terms
+          again, `NO_CHANGE`, brings it back in line if Stripe did not
+          make it). Sending the same token again is
+          safe: Stripe makes the change once, and a change already made
+          answers `applied`.
+
+        Fewer seats than the people on the license (`SEATS_IN_USE`), or
+        fewer devices than are in use (`DEVICES_IN_USE`), is refused:
+        nobody and nothing is removed by a change. A downgrade moves the
+        license to its lower terms just before Stripe is asked (put back
+        if Stripe does not make it), so nothing is taken meanwhile on the
+        limits it removes; a subscription event that still shows the old
+        terms during that time is answered with an error, so Stripe sends
+        it again later. One change at a time is with Stripe for a
+        license: a second waits up to 3 seconds, then answers
+        `CHANGE_IN_PROGRESS`, and is checked again against the
+        subscription and the license once its turn comes. A `429
+        RATE_LIMITED` may also mean too many changes are under way
+        (`Retry-After: 5`); try again shortly. A Stripe that stays busy
+        answers `processing`. `license.quantity_changed`
+        and `plan.changed` fire when the license's seats or plan move.
+      security:
+        - CookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [license_id, preview_token]
+              properties:
+                license_id: { type: string, format: uuid }
+                preview_token:
+                  type: string
+                  description: From `POST /portal/subscription/preview`
+      responses:
+        "200":
+          description: Applied, or waiting for payment
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { $ref: "#/components/schemas/SubscriptionChangeResult" }
+        "202":
+          description: "`processing`: Stripe's answer did not come back"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { $ref: "#/components/schemas/SubscriptionChangeResult" }
+        "400":
+          description: "`BAD_REQUEST`, `PLAN_INACTIVE` or `NOT_SUBSCRIPTION_PLAN`, as for change-plan"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401":
+          $ref: "#/components/responses/SessionRequired"
+        "403":
+          description: "`FORBIDDEN`: not the user's license"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "404":
+          description: "`NOT_FOUND`: no such license"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          $ref: "#/components/responses/SubscriptionChangeRefused"
+        "429":
+          description: "`RATE_LIMITED`: too many requests from this IP, Stripe was busy reading the subscription, or too many changes are under way (`Retry-After` 60 for the first, 5 for the others)"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "500":
+          description: Stripe could not be read
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503":
+          description: "`PAYMENTS_UNAVAILABLE`: Stripe is not configured"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /portal/subscription/pending:
+    post:
+      tags: [Portal]
+      summary: A subscription change waiting for payment
+      description: |
+        For the license owner. Reads the subscription from Stripe (and
+        brings the license up to date with it) and says whether a change
+        waits for payment, where to pay for it, and what it is.
+      security:
+        - CookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [license_id]
+              properties:
+                license_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Pending change, if any
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      status: { type: string, enum: [none, pending_payment] }
+                      hosted_invoice_url: { type: string }
+                      expires_at: { type: string, format: date-time }
+                      quantity: { type: integer }
+                      plan_name: { type: string }
+        "400":
+          description: "`BAD_REQUEST`: license_id missing"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401":
+          $ref: "#/components/responses/SessionRequired"
+        "403":
+          description: "`FORBIDDEN`: not the user's license"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "404":
+          description: "`NOT_FOUND`: no such license"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "429":
+          description: "`RATE_LIMITED`: too many requests from this IP, or Stripe was busy (`Retry-After` 60 for the first, 5 for the other)"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "500":
+          description: Stripe could not be read
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
 
   /portal/subscription/cancel:
@@ -2577,6 +2930,17 @@ paths:
         expired and canceled ones can. The caller's email must match the
         license's (a seat is not enough). `GET /portal/licenses` marks
         each license the caller can upgrade with `upgradable: true`.
+
+        For a plan sold per seat, checkout starts at the people already on
+        the license (or the plan's minimum, if higher) and cannot go below
+        that; a team larger than the plan's maximum is refused with
+        `SEATS_IN_USE`. While that checkout is open nobody new can be
+        invited (`UPGRADE_IN_PROGRESS` on `POST /portal/seats/add`); should
+        the license hold more people than the seats bought all the same,
+        the paid upgrade still applies, everyone stays, and nobody new
+        joins until seats are added or freed. When the upgrade, or undoing it, moves the seats,
+        `license.quantity_changed` fires with `reason` `upgrade` or
+        `upgrade_reverted`.
       security:
         - CookieAuth: []
       requestBody:
@@ -2614,7 +2978,11 @@ paths:
           description: "`NOT_FOUND`: license or plan not found"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "409":
-          description: "`UPGRADE_IN_PROGRESS`, a checkout opened earlier for this license has been paid and is still being applied"
+          description: |
+            `UPGRADE_IN_PROGRESS`, a checkout opened earlier for this license
+            has been paid and is still being applied. `SEATS_IN_USE`, more
+            people are on the license than the plan sells seats
+            (`details.in_use`, `details.seat_limit`)
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "503":
           description: "`UPGRADE_UNAVAILABLE`, the plan's Stripe price can't be sold right now"
@@ -3176,6 +3544,55 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimited"
 
+  /admin/licenses/{id}/quantity:
+    post:
+      tags: [Admin Licenses]
+      summary: Set the seats of a license on a per-seat plan
+      description: |
+        Requires the `admin` or `licenses:write` scope; a bound key only
+        for its product's licenses. For a license nothing bills, such as
+        a sale made outside Stripe: a Stripe subscription's seats are its
+        quantity in Stripe and are refused here (`STRIPE_MANAGED`).
+        Members or devices above a lower limit stay; new ones are refused
+        until there is room. Sends `license.quantity_changed` when the
+        seats changed. Answers with the license, its limits included.
+      x-required-scopes: [admin, "licenses:write"]
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/LicenseID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              properties:
+                quantity: { type: integer, minimum: 1, maximum: 10000 }
+      responses:
+        "200":
+          description: Seats set
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { $ref: "#/components/schemas/License" }
+        "400":
+          description: "`BAD_REQUEST`: quantity missing or out of range"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "404":
+          description: "`NOT_FOUND`: no such license"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: |
+            - `STRIPE_MANAGED`: a Stripe subscription bills the license
+            - `NOT_PER_SEAT`: the license's plan is not sold per seat
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
   /admin/licenses/{id}/valid-until:
     post:
       tags: [Admin Licenses]
@@ -3522,8 +3939,8 @@ paths:
         for its product's licenses. Seats that were not removed, oldest
         first. `active_count` is the number of members: it leaves out the
         owner, who holds a seat without a row, and a seat at the owner's
-        own address. The people counted against `max_seats` are
-        `active_count + 1`.
+        own address. The people counted against the license's seat limit
+        (`seat_limit`) are `active_count + 1`.
       x-required-scopes: [admin, "licenses:write"]
       security:
         - BearerAuth: []
@@ -5053,6 +5470,48 @@ webhooks:
         "200":
           $ref: "#/components/responses/WebhookAck"
 
+  license.quantity_changed:
+    post:
+      tags: [Webhooks]
+      summary: The seats a license is paid for changed
+      description: |
+        Sent when a license's quantity moves on a plan sold per seat (or
+        to or from one): a change the customer made in the portal or the
+        seller made in Stripe, once Stripe applied it, or an admin's
+        change to a license nothing bills. Not sent for a change still
+        waiting for payment. A downgrade is sent as the license takes the
+        lower seats; when Stripe's answer was lost and it turns out not
+        to have made the change, a second event moves them back. The
+        license, when its plan is sold per seat, now holds `new_quantity`
+        people, and its devices are the plan's per-seat value times it.
+      parameters:
+        - $ref: "#/components/parameters/WebhookEventHeader"
+        - $ref: "#/components/parameters/WebhookSignatureHeader"
+        - $ref: "#/components/parameters/WebhookDeliveryHeader"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/WebhookPayload"
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        license_id: { type: string, format: uuid }
+                        email: { type: string }
+                        plan_id: { type: string, format: uuid }
+                        old_quantity: { type: integer }
+                        new_quantity: { type: integer }
+                        reason:
+                          type: string
+                          enum: [upgrade, upgrade_reverted]
+                          description: Present when a free license's upgrade, or undoing it, moved the seats
+      responses:
+        "200":
+          $ref: "#/components/responses/WebhookAck"
+
   quota.warning:
     post:
       tags: [Webhooks]
@@ -5179,9 +5638,12 @@ webhooks:
       tags: [Webhooks]
       summary: A license moved to another plan
       description: |
-        Sent by the portal's change-plan, by `POST
-        /admin/licenses/{id}/change-plan`, and when a paid upgrade is
-        applied, all without `reason`. When an upgrade is undone and the
+        Sent when a portal change (`POST /portal/subscription/change` or
+        change-plan) or an edit in Stripe moves the license's plan (a
+        downgrade as the license takes the new plan, with a second event
+        back should Stripe turn out not to have made it), by
+        `POST /admin/licenses/{id}/change-plan`, and when a paid upgrade
+        is applied, all without `reason`. When an upgrade is undone and the
         license goes back to its free plan, `reason` says why:
         `refund`, `subscription_ended`, `subscription_unpaid`,
         `past_due_timeout`, `grace_period_ended` or `admin_canceled`.
@@ -5468,6 +5930,48 @@ components:
       schema: { type: string, format: uuid }
 
   responses:
+    SubscriptionChangeRefused:
+      description: |
+        The change cannot be made as asked:
+        - `SUBSCRIPTION_NOT_ACTIVE`: the license or subscription is not
+          active or trialing (settle open payments first)
+        - `NO_CHANGE` (preview only): the subscription already has these
+          terms and no change waits for payment
+        - `CHANGE_NOT_SUPPORTED`: a subscription the portal cannot
+          change (on a schedule, several items, metered usage, or no plan
+          of the product), or, for a change charged now, one not charged
+          automatically or with collection paused
+        - `CHANGE_IN_PROGRESS`: another change to this license is being
+          made with Stripe; try again shortly
+        - `PAYMENT_METHOD_UNSUPPORTED`: a change charged now, on a
+          subscription paid with a method Stripe cannot hold a change for
+          until it is paid (bank debits such as SEPA or ACH). Downgrades
+          charge nothing and are not refused this way
+        - `QUANTITY_OUT_OF_RANGE`: the plan sells `details.min` to
+          `details.max` seats; never moved into range silently
+        - `SEATS_IN_USE`: fewer seats than the people on the license
+          (`details.in_use`, `details.seat_limit`)
+        - `DEVICES_IN_USE`: fewer devices (or floating sessions) than are
+          in use (`details.in_use`, `details.activation_limit`;
+          `details.kind` is `activations`, which the owner can remove, or
+          `sessions`, which end on their own). Only a change that lowers
+          a limit is refused this way; one that leaves a license over a
+          limit it was already over goes ahead
+        - `DOWNGRADE_NOT_SUPPORTED`: a change that lowers a limit but
+          raises the other one, costs more for the rest of the period,
+          bills on another schedule (monthly to yearly, say), which Stripe
+          would invoice at once, or moves to another plan from a price no
+          plan sells any more
+        - `PREVIEW_EXPIRED` (change only): the preview is over an hour old,
+          the subscription renewed since, or the plan's limits changed so
+          the change is billed another way
+        - `SUBSCRIPTION_CHANGED`: the subscription moved since the
+          preview, or Stripe replayed an answer for a change made earlier
+          on a subscription that has moved on since
+        - `CHANGE_REFUSED`: Stripe refused it (or, in a preview, would not
+          price it): a payment method that cannot hold a change until paid
+          (bank debits), a plan in another currency, a missing tax address
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     RateLimited:
       description: "`RATE_LIMITED`: too many requests from this IP. `Retry-After` is the bucket's window in seconds (usually 60)."
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -5863,6 +6367,19 @@ components:
         stripe_subscription_id: { type: string }
         stripe_payment_intent_id: { type: string }
         stripe_checkout_session_id: { type: string }
+        quantity:
+          type: integer
+          description: Seats the license is paid for; a Stripe subscription's quantity. Only a plan sold per seat turns it into limits.
+        seat_limit:
+          type: integer
+          description: People the license holds, the owner included (0 = no limit), as the server enforces it; not used on a desktop product, which has no people. Present when the plan is loaded.
+        activation_limit:
+          type: integer
+          description: Devices or floating sessions the license holds, as the server enforces it. Present when the plan is loaded.
+        stripe_pending_update_expires_at:
+          type: string
+          format: date-time
+          description: A subscription change waits for payment until then; absent when none
         signup_source: { type: string, enum: [self_signup] }
         signup_plan_id: { type: string, format: uuid }
         marketing_consent: { type: boolean }
@@ -6043,6 +6560,42 @@ components:
         created_at: { type: string, format: date-time }
         delivered_at: { type: string, format: date-time }
 
+    SubscriptionChangeRequest:
+      type: object
+      required: [license_id]
+      properties:
+        license_id: { type: string, format: uuid }
+        price_id:
+          type: string
+          description: Stripe price id of the plan to move to; empty keeps the plan
+        quantity:
+          type: integer
+          minimum: 0
+          description: Seats on a plan sold per seat; 0 keeps the current number. Within the plan's `min_quantity` and `max_quantity`.
+
+    SubscriptionTerms:
+      type: object
+      properties:
+        plan_id: { type: string, format: uuid }
+        plan_name: { type: string }
+        price_id: { type: string }
+        per_seat: { type: boolean }
+        quantity: { type: integer }
+        seat_limit: { type: integer, description: "0 = no limit" }
+        activation_limit: { type: integer }
+
+    SubscriptionChangeResult:
+      type: object
+      properties:
+        status: { type: string, enum: [applied, pending_payment, processing] }
+        plan_id: { type: string, format: uuid }
+        plan_name: { type: string }
+        quantity: { type: integer }
+        hosted_invoice_url: { type: string, description: "With `pending_payment`: Stripe's page to pay on" }
+        expires_at: { type: string, format: date-time, description: "With `pending_payment`: when Stripe drops the change" }
+        downgrade: { type: boolean, description: "The change lowered a limit: applied at once, billed from the next invoice" }
+        keep: { type: boolean, description: "The subscription's own terms were kept, dropping a change waiting for payment; nothing was charged" }
+
     WebhookEventName:
       type: string
       description: An event a webhook endpoint can subscribe to. `webhook.test` is not one.
@@ -6059,6 +6612,7 @@ components:
         - license.revoked
         - license.payment_failed
         - license.payment_recovered
+        - license.quantity_changed
         - quota.warning
         - quota.exceeded
         - seat.added
