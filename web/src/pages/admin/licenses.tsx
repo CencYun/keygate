@@ -1473,7 +1473,11 @@ function SeatsTab({
                           ? t("portal.roleOwner")
                           : t("portal.roleMember")}
                       </Badge>
-                      {joined ? (
+                      {joined && s.paused ? (
+                        <Badge className="bg-amber-100 text-amber-800" title={t("portal.seatPausedHint")}>
+                          {t("portal.seatPaused")}
+                        </Badge>
+                      ) : joined ? (
                         <Badge className="bg-emerald-100 text-emerald-800">{t("licenses.active")}</Badge>
                       ) : expired ? (
                         <Badge className="bg-red-100 text-red-800">{t("portal.inviteExpired")}</Badge>

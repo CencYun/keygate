@@ -482,6 +482,10 @@ type License struct {
 	// Store.FindLicenseByKey); nil when it was found by the licence's
 	// key or any other way.
 	KeySeat *Seat `bun:"-" json:"-"`
+	// KeySeatPaused: KeySeat is beyond the licence's seat limit (see
+	// Seat.Paused), so the member's key opens the licence but may not be
+	// used. Shown to that member in the portal.
+	KeySeatPaused bool `bun:"-" json:"key_paused,omitempty"`
 }
 
 // Limits are the people and devices this licence holds (see
@@ -588,6 +592,11 @@ type Seat struct {
 	// InviteExpiresAt: pinned at invite-time. After this, accepting
 	// answers 404 SEAT_INVITE_INVALID and the owner must re-invite.
 	InviteExpiresAt *time.Time `json:"invite_expires_at,omitempty"`
+	// Paused: the licence holds more people than its seat limit allows,
+	// and this member is among the last to have joined beyond it, so
+	// their own key may not be used until the owner removes someone or
+	// adds seats. Worked out when read (Store.PausedSeats), never stored.
+	Paused bool `bun:"-" json:"paused,omitempty"`
 	// MemberKey is the member's own license key, made the first time
 	// they open the portal after accepting (see Store.MemberKey) and
 	// cleared when they are removed. It is kept and found the way a

@@ -891,6 +891,9 @@ func (s *Store) FindLicenseByKey(ctx context.Context, key string) (*model.Licens
 		if l.Product == nil || !model.ProductSupports(l.Product.Type, model.CapSeats) {
 			return nil, sql.ErrNoRows
 		}
+		if l.KeySeatPaused, err = s.SeatPaused(ctx, seat.ID); err != nil {
+			return nil, err
+		}
 		l.KeySeat = seat
 		return l, nil
 	}
@@ -1588,13 +1591,26 @@ func (s *Store) FindLicensesForGraceExpiry(ctx context.Context) ([]*model.Licens
 }
 
 // FindExpiredTrials returns trialing licenses that have passed valid_until.
+//
+// A trial a Stripe subscription bills is Stripe's to end: at its end
+// Stripe charges and turns it active, or past due, and says so by
+// webhook, which may come some time after valid_until. Expiring it first
+// would tell a customer who is paying that their trial ended, and clear
+// their devices. It is left to Stripe for the plan's grace days, and only
+// past them, with nothing heard, expired as a trial (webhooks lost for
+// good). At least a day, whatever the grace days: Stripe's charge and
+// webhook take that much. (Whether the key works meanwhile is the grace
+// days' own rule, see assertUsable; with none it stops at valid_until.)
 func (s *Store) FindExpiredTrials(ctx context.Context) ([]*model.License, error) {
 	var out []*model.License
+	now := time.Now()
 	err := s.DB.NewSelect().Model(&out).
 		Relation("Product").Relation("Plan").
 		Where("license.status = 'trialing'").
 		Where("license.valid_until IS NOT NULL").
-		Where("license.valid_until < ?", time.Now()).
+		Where("license.valid_until < ?", now).
+		Where(`(COALESCE(license.stripe_subscription_id, '') = ''
+			OR license.valid_until < ?::timestamptz - make_interval(days => GREATEST(COALESCE("plan"."grace_days", 7), 1)))`, now).
 		Scan(ctx)
 	return out, err
 }
@@ -2518,6 +2534,11 @@ type InUse struct {
 // CountInUse counts what a licence uses of its limits.
 func (s *Store) CountInUse(ctx context.Context, licenseID string) (InUse, error) {
 	return countInUse(ctx, s.DB, licenseID)
+}
+
+// CountInUseIn is CountInUse on a caller's transaction.
+func CountInUseIn(ctx context.Context, db bun.IDB, licenseID string) (InUse, error) {
+	return countInUse(ctx, db, licenseID)
 }
 
 func countInUse(ctx context.Context, db bun.IDB, licenseID string) (InUse, error) {

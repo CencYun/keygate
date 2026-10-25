@@ -868,10 +868,10 @@ func (h *AdminHandler) GetPlan(c *gin.Context) {
 	response.OK(c, p)
 }
 
-// PlanSeatImpact answers how many of the plan's licenses would hold more
-// people than a new max_seats allows, so the dashboard can say so before
+// PlanSeatImpact answers how many of the plan's licenses have more people
+// joined than a new max_seats allows, so the dashboard can say so before
 // an admin lowers it. A change applies to every license on the plan at
-// once; those over the limit keep their members and cannot invite more.
+// once; on those over the limit the members who joined last are paused.
 //
 // GET /admin/plans/:id/seat-impact?max_seats=N → {max_seats, licenses_over}
 func (h *AdminHandler) PlanSeatImpact(c *gin.Context) {
@@ -3858,6 +3858,12 @@ func (h *AdminHandler) ListFloatingSessions(c *gin.Context) {
 
 // ─── Change Plan (admin) ───
 
+// seatsInUseError refuses a change of plan that seats fewer people than
+// the licence has.
+type seatsInUseError struct{ inUse, limit int }
+
+func (e *seatsInUseError) Error() string { return "SEATS_IN_USE" }
+
 func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 	id := c.Param("id")
 	var req struct {
@@ -3913,6 +3919,9 @@ func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 	// that log to answer "why is this licence active now" and "who
 	// moved its expiry date".
 	newStatus, newValidUntil := "", ""
+	// Seats carried to a plan sold per seat, when they changed: they set
+	// both the people and the devices the licence holds.
+	oldQuantity, newQuantity := 0, 0
 	if h.beforeCutoffWrite != nil {
 		h.beforeCutoffWrite()
 	}
@@ -3964,6 +3973,37 @@ func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 			return errStripeBilledPlanChange
 		}
 
+		// Nobody is removed by a change of plan, as in the portal's
+		// downgrade: with more people on or invited to the licence than
+		// the new plan seats, the room is freed first, rather than the
+		// members who joined last finding themselves paused. One that
+		// leaves a licence over a limit it was already over, but no
+		// further, goes ahead. A plan sold per seat takes the seats the
+		// licence holds: its people, within what the plan sells. Asked to
+		// "move" to the plan it is on, nothing changes: its seats are set
+		// where they are set, through Stripe or the quantity control.
+		used, err := store.CountInUseIn(ctx, tx, l.ID)
+		if err != nil {
+			return err
+		}
+		l.Quantity = locked.Quantity
+		if newPlan.PerSeat && newPlan.ID != locked.PlanID {
+			qty := locked.Quantity
+			if !fromPlan.PerSeat {
+				qty = used.People
+			}
+			qty = max(qty, newPlan.MinQuantity, 1)
+			if newPlan.MaxQuantity > 0 {
+				qty = min(qty, newPlan.MaxQuantity)
+			}
+			l.Quantity = qty
+		}
+		oldSeats, _ := fromPlan.Limits(locked.Quantity)
+		newSeats, _ := newPlan.Limits(l.Quantity)
+		if newSeats > 0 && used.People > newSeats && (oldSeats == 0 || newSeats < oldSeats) {
+			return &seatsInUseError{inUse: used.People, limit: newSeats}
+		}
+
 		// The maintenance period follows the license type. Leaving
 		// perpetual clears it (subscriptions follow valid_until);
 		// entering perpetual starts the new plan's period; moving
@@ -3975,6 +4015,10 @@ func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 		// of the old one is closed with it.
 		update := store.UpdateLicenseIn
 		cols := []string{"plan_id"}
+		if l.Quantity != locked.Quantity {
+			cols = append(cols, "quantity")
+			oldQuantity, newQuantity = locked.Quantity, l.Quantity
+		}
 		grantsPeriod := false
 		switch {
 		case newPlan.LicenseType != "perpetual":
@@ -4084,6 +4128,13 @@ func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 		return store.SyncLicenseSubscriptionIn(ctx, tx, l.ID, newPlan, effectiveStatus, effectiveUntil)
 	})
 	if err != nil {
+		var seats *seatsInUseError
+		if errors.As(err, &seats) {
+			response.Conflict(c, "SEATS_IN_USE",
+				fmt.Sprintf("%d people are on or invited to this license; remove %d before moving it to a plan with %d seats", seats.inUse, seats.inUse-seats.limit, seats.limit),
+				gin.H{"in_use": seats.inUse, "seat_limit": seats.limit})
+			return
+		}
 		if errors.Is(err, errStripeBilledPlanChange) {
 			// Says what to do next, in order: the portal moves the
 			// subscription in Stripe as well, and cancelling alone is
@@ -4109,18 +4160,24 @@ func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 		return
 	}
 
+	changes := changesWith(changesWith(
+		map[string]any{"old_plan_id": oldPlanID, "new_plan_id": req.PlanID},
+		"status", newStatus), "valid_until", newValidUntil)
+	if newQuantity != 0 {
+		changes["old_quantity"], changes["new_quantity"] = oldQuantity, newQuantity
+	}
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "license", EntityID: id, Action: "plan_changed",
 		ActorType: "admin", ActorID: adminID(c),
-		Changes: changesWith(changesWith(
-			map[string]any{"old_plan_id": oldPlanID, "new_plan_id": req.PlanID},
-			"status", newStatus), "valid_until", newValidUntil),
+		Changes: changes,
 	})
 
 	if h.Webhook != nil {
-		h.Webhook.Dispatch(c, l.ProductID, "plan.changed", map[string]any{
-			"license_id": id, "old_plan_id": oldPlanID, "new_plan_id": req.PlanID,
-		})
+		payload := map[string]any{"license_id": id, "old_plan_id": oldPlanID, "new_plan_id": req.PlanID}
+		if newQuantity != 0 {
+			payload["old_quantity"], payload["new_quantity"] = oldQuantity, newQuantity
+		}
+		h.Webhook.Dispatch(c, l.ProductID, "plan.changed", payload)
 	}
 
 	if h.Email != nil && l.Email != "" {

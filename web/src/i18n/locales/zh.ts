@@ -28,6 +28,9 @@ const zh = {
   "acceptInvite.missingTokenDesc": "此 URL 不包含有效邀请 token。请重新打开邮件中的链接。",
   "acceptInvite.invalidTitle": "邀请无效或已过期",
   "acceptInvite.invalidDesc": "此邀请已被使用、已被撤销或已过期。请联系许可证所有者重新发送。",
+  "acceptInvite.noSeatTitle": "暂时没有空余席位",
+  "acceptInvite.noSeatDesc":
+    "这个许可证的席位已经全部占用。你的邀请仍然有效：请联系许可证所有者腾出一个席位，然后再次打开这个链接。",
   "acceptInvite.acceptedTitle": "欢迎加入 {product}",
   "acceptInvite.acceptedTitleNoProduct": "邀请已接受",
   "acceptInvite.acceptedDesc": "你已获得这个许可证的使用权限。打开门户即可获取你自己的许可证密钥。",
@@ -127,7 +130,7 @@ const zh = {
   "plans.perSeatValue": "每席位 {count}",
   "plans.seatsLowerTitle": "要调低席位上限吗？",
   "plans.seatsLowerConfirm":
-    "这个套餐下有 {count} 个许可证的人数已经超过 {max} 人。已有成员会保留访问权限，但在人数低于上限之前，不能再邀请新成员。修改会立即作用于这个套餐下的所有许可证；如果只想改变新客户的条件，请新建一个套餐。",
+    "这个套餐下有 {count} 个许可证的人数已经超过 {max} 人。这些许可证上最后加入的成员会被暂停，在有空余席位之前无法使用自己的密钥，也不能再邀请新成员。修改会立即作用于这个套餐下的所有许可证；如果只想改变新客户的条件，请新建一个套餐。",
   "plans.licenseModel": "授权模型",
   "plans.modelStandard": "标准",
   "plans.modelFloating": "浮动 (并发)",
@@ -623,6 +626,13 @@ const zh = {
   "portal.inviteExpired": "已过期",
   "portal.seatLimitPendingHint": "待接受的邀请也占名额，取消后即可腾出。",
   "portal.cancelInviteDesc": "发给 {email} 的邀请将被取消，邀请链接随即失效。之后可重新邀请。",
+  "portal.seatPaused": "已暂停",
+  "portal.seatPausedHint": "超出席位上限：在有空余席位之前，该成员无法使用自己的密钥。",
+  "portal.pausedMembers":
+    "有 {count} 位成员已暂停：这个许可证的人数超过了席位数，最后加入的成员需要等待空余席位。移除成员或获得更多席位后即可恢复。",
+  "portal.usagePaused": "你的使用权限暂停期间，不显示用量。",
+  "portal.keyPaused":
+    "你的使用权限已暂停：这个许可证的人数超过了席位数。请联系许可证所有者腾出席位或增加席位，有空位后你的密钥会立即恢复可用。",
   "portal.memberKeyHint": "这是你个人的密钥，被移除后会失效。",
   "portal.myDevices": "我的设备",
   "portal.teamDevices": "全部设备",

@@ -288,3 +288,33 @@ func TestPortalViewerSeat_Oldest(t *testing.T) {
 		t.Fatalf("the owner got seat %v", got)
 	}
 }
+
+// Over the seat limit, the portal tells the paused member why their key
+// does not work, and marks them for the owner.
+func TestPortalLicenseView_PausedMember(t *testing.T) {
+	p := newPortalTeam(t)
+	ctx, s, lic := p.f.ctx, p.f.s, p.f.licA
+	if _, err := s.DB.NewRaw("UPDATE plans SET max_seats = 1 WHERE id = ?", lic.PlanID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	l := p.listed(t, p.alice.Email)
+	if _, ok, err := PortalLicenseView(ctx, s, l, p.alice.Email); err != nil || !ok || !l.KeySeatPaused {
+		t.Fatalf("member view: ok %v, paused %v, %v; want her told she is paused", ok, l.KeySeatPaused, err)
+	}
+	l = p.listed(t, lic.Email)
+	if _, ok, err := PortalLicenseView(ctx, s, l, lic.Email); err != nil || !ok || l.KeySeatPaused {
+		t.Fatalf("owner view: ok %v, paused %v, %v; the owner is never paused", ok, l.KeySeatPaused, err)
+	}
+	marked := false
+	for _, seat := range l.Seats {
+		if seat.ID == p.alice.ID {
+			marked = seat.Paused
+		}
+		if seat.ID == p.pending.ID && seat.Paused {
+			t.Fatal("a pending invitation is marked paused; it has no access to pause")
+		}
+	}
+	if !marked {
+		t.Fatal("the owner's list does not mark alice paused")
+	}
+}

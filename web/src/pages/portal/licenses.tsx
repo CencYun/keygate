@@ -211,6 +211,12 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
           </Button>
         </div>
         {!isOwner && <p className="text-xs text-muted-foreground -mt-2">{t("portal.memberKeyHint")}</p>}
+        {/* Over the seat limit: the key is shown, and why it does not work. */}
+        {!isOwner && lic.key_paused && (
+          <p className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm dark:bg-amber-950/30">
+            {t("portal.keyPaused")}
+          </p>
+        )}
 
         {/* Overview stats */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
@@ -708,6 +714,9 @@ function SeatsSection({ license, onAddSeats }: { license: PortalLicense; onAddSe
   // without a row, as max_seats counts them on the server. A member is
   // sent only those who have joined, so they see no limit beside it.
   const activeCount = members.filter((s) => !s.removed_at).length + 1
+  // Members beyond the seat limit (the last to join) whose keys wait for
+  // a free place.
+  const pausedCount = members.filter((s) => s.paused).length
   // maxSeats=0 means "no limit"; never gate the Add button in that case.
   // The server's limit: the seats bought, on a plan sold per seat.
   const maxSeats = license.seat_limit ?? license.plan?.max_seats ?? 0
@@ -745,6 +754,9 @@ function SeatsSection({ license, onAddSeats }: { license: PortalLicense; onAddSe
       </div>
 
       {canManage && !inUse && <p className="text-xs text-muted-foreground">{t("portal.inviteNeedsActive")}</p>}
+      {canManage && pausedCount > 0 && (
+        <p className="text-xs text-amber-700">{t("portal.pausedMembers").replace("{count}", String(pausedCount))}</p>
+      )}
 
       {canManage && inUse && atLimit && (
         <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -758,7 +770,12 @@ function SeatsSection({ license, onAddSeats }: { license: PortalLicense; onAddSe
                     ? t("portal.seatLimitSettleFirst")
                     : t("portal.seatLimitFull")}
             </p>
-            {members.some((s) => !s.removed_at && !s.accepted_at) && <p>{t("portal.seatLimitPendingHint")}</p>}
+            {/* Cancelling an invitation frees a seat for a new one, but
+                does not let a paused member back: pausing counts only
+                those who joined. */}
+            {pausedCount === 0 && members.some((s) => !s.removed_at && !s.accepted_at) && (
+              <p>{t("portal.seatLimitPendingHint")}</p>
+            )}
           </div>
           {onAddSeats && (
             <Button size="sm" variant="outline" onClick={onAddSeats}>
@@ -865,6 +882,11 @@ function SeatRow({
           {!accepted && (
             <Badge variant="outline" className={cn("text-xs", expired && "text-destructive")}>
               {t(expired ? "portal.inviteExpired" : "portal.seatPending")}
+            </Badge>
+          )}
+          {seat.paused && (
+            <Badge variant="outline" className="text-xs text-amber-700" title={t("portal.seatPausedHint")}>
+              {t("portal.seatPaused")}
             </Badge>
           )}
         </div>
@@ -1001,7 +1023,13 @@ function InviteSeatDialog({ license, onClose }: { license: PortalLicense; onClos
 }
 
 function QuotaUsageSection({ license }: { license: PortalLicense }) {
+  const { t } = useI18n()
   const quotaEntitlements = (license.plan?.entitlements || []).filter((e) => e.value_type === "quota")
+
+  // A paused member's key reads no usage until a seat is free.
+  if (license.key_paused) {
+    return <p className="text-sm text-muted-foreground py-4 text-center">{t("portal.usagePaused")}</p>
+  }
 
   if (quotaEntitlements.length === 0) {
     return <p className="text-sm text-muted-foreground py-4 text-center">No quota-based features.</p>

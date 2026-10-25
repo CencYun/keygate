@@ -112,8 +112,8 @@ export default function PlansPage() {
       showToast(errorCode(e) === "PER_SEAT_LOCKED" ? t("plans.perSeatLockedError") : e.message, "error"),
   })
   // A plan's limits apply to every license on it at once. Lowering
-  // max_seats leaves the licenses already above it with their members
-  // but no room to invite, so the admin sees how many first.
+  // max_seats pauses the members who joined last on the licenses
+  // already above it, so the admin sees how many first.
   const saveEdit = async (plan: Plan, update: Partial<Plan> & { id: string }) => {
     const next = update.max_seats ?? plan.max_seats
     const prev = plan.max_seats

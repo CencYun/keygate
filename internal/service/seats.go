@@ -221,6 +221,12 @@ func (s *SeatService) AcceptSeatInvite(ctx context.Context, plainToken string) (
 			return nil, apperr.New(404, "SEAT_INVITE_INVALID",
 				"this invitation is invalid or has expired")
 		}
+		// The token holder is the invitee, so saying why is no leak;
+		// the invite stands and works once a seat is free.
+		if errors.Is(err, store.ErrSeatLimitReached) {
+			return nil, apperr.Conflict("SEAT_LIMIT",
+				"no seat is free on this license right now; ask the license owner to free one, then open the invitation again")
+		}
 		return nil, apperr.Internal(err)
 	}
 	// Refuse to claim a seat on a license that's no longer in good
@@ -349,6 +355,9 @@ func (s *SeatService) ListSeats(ctx context.Context, licenseKey, productID, acto
 	}
 	if !strings.EqualFold(lic.Email, actorEmail) {
 		seats = model.JoinedSeats(seats)
+	}
+	if err := s.store.MarkPausedSeats(ctx, lic.ID, seats); err != nil {
+		return nil, apperr.Internal(err)
 	}
 	return seats, nil
 }

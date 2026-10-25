@@ -54,6 +54,14 @@ func PortalLicenseView(ctx context.Context, st *store.Store, lic *model.License,
 		lic.Activations = OwnDevices(lic.Activations, viewer.ID)
 		lic.Seats = model.JoinedSeats(lic.Seats)
 		trimForMember(lic)
+		// Over the seat limit, their key opens nothing usable: they are
+		// told why, not left with a key that silently fails.
+		if lic.KeySeatPaused, err = st.SeatPaused(ctx, fresh.ID); err != nil {
+			return "", false, err
+		}
+	}
+	if err := st.MarkPausedSeats(ctx, lic.ID, lic.Seats); err != nil {
+		return "", false, err
 	}
 	if err := st.FillMemberEmails(ctx, lic.Activations); err != nil {
 		return "", false, err

@@ -188,6 +188,71 @@ func lockLicenseIn(ctx context.Context, tx bun.Tx, licenseID string) error {
 	return err
 }
 
+// seatLimitSQL is a licence's seat limit, the owner included, as
+// Plan.Limits reads it: the seats bought on a plan sold per seat, else
+// the plan's max_seats; 0 is no limit. l is the licence, pl its plan.
+const seatLimitSQL = `(CASE WHEN pl.per_seat THEN GREATEST(l.quantity, 1) ELSE pl.max_seats END)`
+
+// seatPausedSQL is true for a joined seat s of licence l (plan pl) whose
+// member is beyond the seat limit: the owner holds one place, and the
+// members who joined first hold the rest, so those who joined last wait
+// until a place is free. Nothing is stored: removing a member or adding
+// seats lets the next in line back at once. A seat at the owner's own
+// address is the owner, never paused, and counts no place of its own.
+const seatPausedSQL = seatLimitSQL + ` > 0 AND lower(s.email) <> lower(l.email)
+	AND (SELECT count(*) FROM seats o WHERE o.license_id = s.license_id AND o.removed_at IS NULL
+		AND o.accepted_at IS NOT NULL AND lower(o.email) <> lower(l.email)
+		AND (o.accepted_at, o.id) < (s.accepted_at, s.id)) >= ` + seatLimitSQL + ` - 1`
+
+// SeatPaused reports whether the member of a joined seat is paused (see
+// seatPausedSQL).
+func (s *Store) SeatPaused(ctx context.Context, seatID string) (bool, error) {
+	var paused bool
+	err := s.DB.NewRaw(`SELECT COALESCE((SELECT `+seatPausedSQL+` FROM seats s
+		JOIN licenses l ON l.id = s.license_id JOIN plans pl ON pl.id = l.plan_id
+		WHERE s.id = ? AND s.removed_at IS NULL AND s.accepted_at IS NOT NULL), false)`, seatID).Scan(ctx, &paused)
+	return paused, err
+}
+
+// PausedSeats returns the joined seats of a licence whose members are
+// paused, by seat ID: the rule of seatPausedSQL, ranked in one pass
+// rather than counted again for each seat, as a list of a large licence
+// would. A member's place in the join order is n, and the owner holds
+// the first seat, so those from the limit on wait.
+func (s *Store) PausedSeats(ctx context.Context, licenseID string) (map[string]bool, error) {
+	var ids []string
+	if err := s.DB.NewRaw(`SELECT id FROM (
+		SELECT s.id, `+seatLimitSQL+` AS lim,
+			row_number() OVER (ORDER BY s.accepted_at, s.id) AS n
+		FROM seats s JOIN licenses l ON l.id = s.license_id JOIN plans pl ON pl.id = l.plan_id
+		WHERE s.license_id = ? AND s.removed_at IS NULL AND s.accepted_at IS NOT NULL
+			AND lower(s.email) <> lower(l.email)) ranked
+		WHERE lim > 0 AND n >= lim`,
+		licenseID).Scan(ctx, &ids); err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out, nil
+}
+
+// MarkPausedSeats sets Seat.Paused on seats of one licence.
+func (s *Store) MarkPausedSeats(ctx context.Context, licenseID string, seats []*model.Seat) error {
+	if len(seats) == 0 {
+		return nil
+	}
+	paused, err := s.PausedSeats(ctx, licenseID)
+	if err != nil {
+		return err
+	}
+	for _, seat := range seats {
+		seat.Paused = paused[seat.ID]
+	}
+	return nil
+}
+
 // keyHeldIn reports whether key still opens the licence the way the
 // caller found it: as the member's key when seatID is set (while the
 // product has seats, as FindLicenseByKey holds it), else as the
@@ -196,10 +261,13 @@ func keyHeldIn(ctx context.Context, tx bun.Tx, licenseID, seatID, key string) (b
 	var held bool
 	var err error
 	if seatID != "" {
+		// Not while the member is paused (over the seat limit): read
+		// under the licence lock, so a seat change cannot slip between.
 		err = tx.NewRaw(`SELECT EXISTS (SELECT 1 FROM seats s
 			JOIN licenses l ON l.id = s.license_id JOIN products p ON p.id = l.product_id
+			JOIN plans pl ON pl.id = l.plan_id
 			WHERE s.id = ? AND s.license_id = ? AND s.member_key_hash = ? AND s.removed_at IS NULL
-			AND s.accepted_at IS NOT NULL AND p.type IN (?))`,
+			AND s.accepted_at IS NOT NULL AND p.type IN (?) AND NOT (`+seatPausedSQL+`))`,
 			seatID, licenseID, license.HashKey(key), bun.In(model.ProductTypesSupporting(model.CapSeats))).Scan(ctx, &held)
 	} else {
 		err = tx.NewRaw(`SELECT EXISTS (SELECT 1 FROM licenses

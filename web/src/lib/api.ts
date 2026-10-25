@@ -206,7 +206,8 @@ export const checkout = {
 // ─── Invites (public, token-only) ───
 // The plain invite token IS the email-ownership proof — no session
 // required. Backend collapses bad/expired/already-accepted into one
-// generic error so an attacker can't probe token validity.
+// generic error so an attacker can't probe token validity; only a valid
+// invitation with no seat free says so (SEAT_LIMIT).
 export const invites = {
   accept: (token: string) =>
     post<{ user_id: string; email: string; license_id: string; product_name?: string; role: string }>(
@@ -858,6 +859,8 @@ export interface PortalLicense extends License {
   license_key: string
   // The owner can upgrade it to a paid plan now, keeping the key.
   upgradable?: boolean
+  // For a member: their seat is paused (over the seat limit).
+  key_paused?: boolean
   // Its subscription ends at the period end rather than renews (owner only).
   cancel_scheduled?: boolean
 }
@@ -921,6 +924,9 @@ export interface Seat {
   user_id?: string
   invited_at: string
   invite_expires_at?: string
+  // Over the licence's seat limit: joined after the places ran out, so
+  // their own key may not be used until a place is free.
+  paused?: boolean
   accepted_at?: string
   removed_at?: string
   created_at: string

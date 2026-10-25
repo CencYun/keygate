@@ -1248,3 +1248,233 @@ func TestAccept_DropsALeftoverKey(t *testing.T) {
 		t.Fatalf("key after accepting = %q, want a new one", k)
 	}
 }
+
+// With more people than seats, the members who joined last are paused:
+// their key opens the licence but activates nothing, until a place is
+// free again, by a removal or more seats, which needs nothing stored.
+// The owner, and a seat at the owner's address, are never paused.
+func TestSeatsBeyondTheLimitArePaused(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	_, plan, lic := perSeatLicense(t, s, ctx, 5, false)
+	var seats []*model.Seat
+	var keys []string
+	for _, who := range []string{"a", "b", "c"} {
+		seat := acceptedMember(t, s, ctx, lic, who)
+		seats, keys = append(seats, seat), append(keys, memberKey(t, s, ctx, seat))
+		time.Sleep(2 * time.Millisecond) // a join order that is unambiguous
+	}
+	paused := func() string {
+		t.Helper()
+		got, err := s.PausedSeats(ctx, lic.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := ""
+		for i, seat := range seats {
+			if got[seat.ID] {
+				out += []string{"a", "b", "c"}[i]
+			}
+		}
+		return out
+	}
+	if p := paused(); p != "" {
+		t.Fatalf("paused with room for everyone: %q", p)
+	}
+
+	// Three seats: the owner, a and b. c joined last and waits.
+	setQuantity(t, s, ctx, lic.ID, 3)
+	if p := paused(); p != "c" {
+		t.Fatalf("paused on 3 seats = %q, want c", p)
+	}
+	if found, err := s.FindLicenseByKey(ctx, keys[2]); err != nil || !found.KeySeatPaused {
+		t.Fatalf("c's key: %v, paused %v; want it found and paused", err, found != nil && found.KeySeatPaused)
+	}
+	if found, err := s.FindLicenseByKey(ctx, keys[0]); err != nil || found.KeySeatPaused {
+		t.Fatalf("a's key: %v; want it found and not paused", err)
+	}
+	if err := activateFor(s, ctx, lic, seats[2].ID, keys[2], "c-pc"); !errors.Is(err, store.ErrKeyRevoked) {
+		t.Fatalf("c activating while paused = %v, want ErrKeyRevoked", err)
+	}
+	if err := activateFor(s, ctx, lic, seats[0].ID, keys[0], "a-pc"); err != nil {
+		t.Fatalf("a activating: %v", err)
+	}
+
+	// a leaves: c's turn, with nothing to do but read again.
+	if _, _, err := s.RemoveSeat(ctx, seats[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if p := paused(); p != "" {
+		t.Fatalf("paused after a left = %q, want nobody", p)
+	}
+	if err := activateFor(s, ctx, lic, seats[2].ID, keys[2], "c-pc"); err != nil {
+		t.Fatalf("c activating once a place is free: %v", err)
+	}
+
+	// One seat: the owner alone; b and c both wait.
+	setQuantity(t, s, ctx, lic.ID, 1)
+	if p := paused(); p != "bc" {
+		t.Fatalf("paused on 1 seat = %q, want bc", p)
+	}
+
+	// A plan not sold per seat counts max_seats; 0 is no limit.
+	if _, err := s.DB.NewRaw("UPDATE plans SET per_seat = false, license_type = 'subscription', max_seats = 2 WHERE id = ?", plan.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p := paused(); p != "c" {
+		t.Fatalf("paused on a 2-person plan = %q, want c", p)
+	}
+	if _, err := s.DB.NewRaw("UPDATE plans SET max_seats = 0 WHERE id = ?", plan.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p := paused(); p != "" {
+		t.Fatalf("paused with no limit = %q, want nobody", p)
+	}
+
+	// The licence's address moves to b's: b is the owner now, never
+	// paused, and holds no member's place.
+	if _, err := s.DB.NewRaw("UPDATE plans SET max_seats = 1 WHERE id = ?", plan.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.NewRaw("UPDATE licenses SET email = ? WHERE id = ?", strings.ToUpper(seats[1].Email), lic.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p := paused(); p != "c" {
+		t.Fatalf("paused with b as the owner on 1 seat = %q, want c", p)
+	}
+}
+
+// A trial a Stripe subscription bills is left to Stripe at its end, for
+// the plan's grace days (at least one), so a customer whose trial is
+// turning into a paid subscription is not expired before Stripe says so;
+// past that, with nothing heard, it is expired as any trial is.
+func TestFindExpiredTrials_LeavesStripeTrialsToStripe(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	trial := func(name string, ago time.Duration, stripe bool) *model.License {
+		t.Helper()
+		_, _, lic := perSeatLicense(t, s, ctx, 1, false)
+		sub := ""
+		if stripe {
+			sub = "sub_trial_" + name + "_" + lic.ID
+		}
+		if _, err := s.DB.NewRaw(`UPDATE licenses SET status = 'trialing', valid_until = ?, stripe_subscription_id = NULLIF(?, '')
+			WHERE id = ?`, time.Now().Add(-ago), sub, lic.ID).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.DB.NewRaw("UPDATE plans SET grace_days = 0 WHERE id = (SELECT plan_id FROM licenses WHERE id = ?)", lic.ID).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return lic
+	}
+	plain := trial("plain", time.Hour, false)
+	converting := trial("converting", time.Hour, true)
+	silent := trial("silent", 50*time.Hour, true)
+	found, err := s.FindExpiredTrials(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, l := range found {
+		got[l.ID] = true
+	}
+	if !got[plain.ID] || got[converting.ID] || !got[silent.ID] {
+		t.Fatalf("expired trials: plain %v, converting Stripe trial %v, Stripe trial silent past a day %v; want true, false, true",
+			got[plain.ID], got[converting.ID], got[silent.ID])
+	}
+}
+
+// An invitation accepted while every seat is taken would only make a
+// paused member: it is refused with nothing changed, the invitation
+// still good, and accepted once a seat is free.
+func TestAccept_WaitsForAFreeSeat(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	_, _, lic := perSeatLicense(t, s, ctx, 3, false)
+	alice := acceptedMember(t, s, ctx, lic, "alice")
+	acceptedMember(t, s, ctx, lic, "bob")
+	plain, hash := store.GenerateSeatInviteToken()
+	invited := &model.Seat{LicenseID: lic.ID, Email: "carol-" + lic.ID[:8] + "@example.com", Role: "member",
+		InviteTokenHash: hash}
+	until := time.Now().Add(time.Hour)
+	invited.InviteExpiresAt = &until
+	if err := s.CreateSeat(ctx, invited); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AcceptSeatInvite(ctx, plain); !errors.Is(err, store.ErrSeatLimitReached) {
+		t.Fatalf("accepting with every seat taken = %v, want ErrSeatLimitReached", err)
+	}
+	if got, err := s.FindSeatByID(ctx, invited.ID); err != nil || got.AcceptedAt != nil || got.InviteTokenHash != hash {
+		t.Fatalf("after the refusal: %v, %+v; want the invitation as it was", err, got)
+	}
+	if _, _, err := s.RemoveSeat(ctx, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, seat, err := s.AcceptSeatInvite(ctx, plain); err != nil || seat.AcceptedAt == nil {
+		t.Fatalf("accepting once a seat is free: %v", err)
+	}
+}
+
+// The join order decides, ties broken by seat ID; a seat at the owner's
+// address and a pending invitation neither wait nor hold a place; and
+// the licence's list and each member's own check always agree.
+func TestPausedSeats_OrderAndAgreement(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	_, _, lic := perSeatLicense(t, s, ctx, 5, false)
+	x := acceptedMember(t, s, ctx, lic, "x")
+	y := acceptedMember(t, s, ctx, lic, "y")
+	z := acceptedMember(t, s, ctx, lic, "z")
+	joined := time.Now().Add(-time.Hour)
+	if _, err := s.DB.NewRaw("UPDATE seats SET accepted_at = ? WHERE id IN (?, ?)", joined, x.ID, y.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ownerSeat := &model.Seat{LicenseID: lic.ID, Email: strings.ToUpper(lic.Email), Role: "member", AcceptedAt: &joined}
+	pending := &model.Seat{LicenseID: lic.ID, Email: "pending-" + lic.ID[:8] + "@example.com", Role: "member"}
+	for _, seat := range []*model.Seat{ownerSeat, pending} {
+		if err := s.CreateSeat(ctx, seat); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, second := x, y // tied on the time: the lower ID came first
+	if y.ID < x.ID {
+		first, second = y, x
+	}
+	// Rewritten, the first is stored after the second, so an order that
+	// fell back on how rows lie would get the tie the wrong way round.
+	if _, err := s.DB.NewRaw("UPDATE seats SET role = role WHERE id = ?", first.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		quantity int
+		want     []*model.Seat
+	}{
+		{4, nil},              // the owner and three members
+		{3, []*model.Seat{z}}, // z joined last
+		{2, []*model.Seat{second, z}},
+		{1, []*model.Seat{first, second, z}},
+	} {
+		setQuantity(t, s, ctx, lic.ID, tc.quantity)
+		got, err := s.PausedSeats(ctx, lic.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]bool{}
+		for _, seat := range tc.want {
+			want[seat.ID] = true
+		}
+		for _, seat := range []*model.Seat{x, y, z, ownerSeat, pending} {
+			one, err := s.SeatPaused(ctx, seat.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got[seat.ID] != want[seat.ID] || one != want[seat.ID] {
+				t.Errorf("%d seats, %s: listed %v, own check %v, want %v", tc.quantity, seat.Email, got[seat.ID], one, want[seat.ID])
+			}
+		}
+	}
+}

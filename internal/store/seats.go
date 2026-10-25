@@ -330,9 +330,23 @@ func (s *Store) AcceptSeatInvite(ctx context.Context, plainToken string) (*model
 	// have rotated to something else between SELECT and lock
 	// acquisition; the seat is only "the invite we were sent" if
 	// the hash STILL matches what the token hashes to.
+	//
+	// The licence first, then the seat, the order every path that
+	// takes both keeps: whether a seat is free is decided under the
+	// licence lock, as an invite is.
+	var licenseID string
+	if err := tx.NewRaw("SELECT license_id FROM seats WHERE invite_token_hash = ?", hash).Scan(ctx, &licenseID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, ErrSeatInviteInvalid
+		}
+		return nil, nil, err
+	}
+	if err := lockLicenseIn(ctx, tx, licenseID); err != nil {
+		return nil, nil, err
+	}
 	seat := new(model.Seat)
 	err = tx.NewSelect().Model(seat).
-		Where("invite_token_hash = ?", hash).
+		Where("invite_token_hash = ? AND license_id = ?", hash, licenseID).
 		For("UPDATE").
 		Scan(ctx)
 	if err != nil {
@@ -351,6 +365,26 @@ func (s *Store) AcceptSeatInvite(ctx context.Context, plainToken string) (*model
 	}
 	if seat.InviteExpiresAt == nil || seat.InviteExpiresAt.Before(time.Now()) {
 		return nil, nil, ErrSeatInviteInvalid
+	}
+	// Joining needs a free place: with the places all taken (the limit
+	// lowered since the invite was sent), the member would only be
+	// paused. Refused before anything changes, so the invite stands and
+	// works once a seat is free. A seat at the owner's address is the
+	// owner, who holds a place already.
+	var room struct {
+		Limit  int  `bun:"lim"`
+		Joined int  `bun:"joined"`
+		Owner  bool `bun:"is_owner"`
+	}
+	if err := tx.NewRaw(`SELECT `+seatLimitSQL+` AS lim,
+		(SELECT count(*) FROM seats o WHERE o.license_id = l.id AND o.removed_at IS NULL
+			AND o.accepted_at IS NOT NULL AND lower(o.email) <> lower(l.email)) AS joined,
+		lower(?) = lower(l.email) AS is_owner
+		FROM licenses l JOIN plans pl ON pl.id = l.plan_id WHERE l.id = ?`, seat.Email, licenseID).Scan(ctx, &room); err != nil {
+		return nil, nil, err
+	}
+	if room.Limit > 0 && !room.Owner && room.Joined+1 >= room.Limit {
+		return nil, nil, ErrSeatLimitReached
 	}
 
 	// Find-or-create user by the SEAT's email (not client input).
@@ -494,10 +528,11 @@ func (s *Store) ListSeats(ctx context.Context, licenseID string, p Page) ([]*mod
 const memberSeatsSQL = `SELECT COUNT(*) FROM seats s JOIN licenses l ON l.id = s.license_id
 	WHERE s.license_id = ? AND s.removed_at IS NULL AND lower(s.email) <> lower(l.email)`
 
-// CountLicensesOverSeatLimit returns how many licenses on the plan hold
-// more people, the owner included, than maxSeats would allow: what
-// lowering the plan's max_seats to it would leave over the limit. Their
-// members stay; they only cannot invite more. 0 when maxSeats <= 0 (no
+// CountLicensesOverSeatLimit returns how many licenses on the plan have
+// more people joined, the owner included, than maxSeats would allow:
+// those on which lowering the plan's max_seats to it would pause the
+// members who joined last (see seatPausedSQL). Pending invitations are
+// not counted; they only wait for a free seat. 0 when maxSeats <= 0 (no
 // limit).
 func (s *Store) CountLicensesOverSeatLimit(ctx context.Context, planID string, maxSeats int) (int, error) {
 	if maxSeats <= 0 {
@@ -506,7 +541,8 @@ func (s *Store) CountLicensesOverSeatLimit(ctx context.Context, planID string, m
 	var n int
 	err := s.DB.NewRaw(`SELECT COUNT(*) FROM licenses l WHERE l.plan_id = ? AND 1 + (
 		SELECT COUNT(*) FROM seats s
-		WHERE s.license_id = l.id AND s.removed_at IS NULL AND lower(s.email) <> lower(l.email)) > ?`,
+		WHERE s.license_id = l.id AND s.removed_at IS NULL AND s.accepted_at IS NOT NULL
+			AND lower(s.email) <> lower(l.email)) > ?`,
 		planID, maxSeats).Scan(ctx, &n)
 	return n, err
 }

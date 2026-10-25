@@ -110,6 +110,9 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 	if err := s.assertUsable(lic); err != nil {
 		return nil, err
 	}
+	if err := seatPaused(lic); err != nil {
+		return nil, err
+	}
 	if err := refuseFloating(lic); err != nil {
 		return nil, err
 	}
@@ -313,7 +316,7 @@ func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyRes
 	// non-existent-key path returns, so the endpoint can't be used to probe
 	// which license_key strings are real. Paid users learn lifecycle state
 	// via email + the (session-auth) portal, not via this routine call.
-	if err := s.assertUsable(lic); err != nil {
+	if err := firstErr(s.assertUsable(lic), seatPaused(lic)); err != nil {
 		locked := s.recordFailure(in.IPAddress)
 		middleware.LicenseVerifications.WithLabelValues(lic.ProductID, "unusable").Inc()
 		if locked != nil {
@@ -524,10 +527,32 @@ func loadLicenseForSDK(ctx context.Context, st *store.Store, key, productID, cap
 			return nil, licenseNotFound()
 		}
 	}
-	if usabilityRequired && !IsLicenseUsable(lic) {
+	if usabilityRequired && (!IsLicenseUsable(lic) || lic.KeySeatPaused) {
 		return nil, licenseNotFound()
 	}
 	return lic, nil
+}
+
+// seatPaused refuses a member's key while the member is paused: the
+// licence holds more people than seats, and they joined beyond the limit
+// (see Store.SeatPaused). The owner frees a place, by removing a member
+// or adding seats, and the key works again.
+func seatPaused(lic *model.License) error {
+	if lic.KeySeat != nil && lic.KeySeatPaused {
+		return apperr.New(403, "SEAT_PAUSED",
+			"this member's seat is paused: the license has more people than seats; the owner can remove a member or add seats")
+	}
+	return nil
+}
+
+// firstErr is the first of errs that is not nil.
+func firstErr(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // requireProductCapability is the central guard for product-type

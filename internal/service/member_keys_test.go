@@ -167,6 +167,41 @@ func TestMemberKeyThroughTheSDK(t *testing.T) {
 		t.Fatalf("member key releasing their own device: %v", err)
 	}
 
+	// Over the seat limit (the plan lowered to the owner alone), alice is
+	// paused: activating says so, verifying answers as any key that may
+	// not be used does; the owner carries on. Room again, she does too.
+	if _, err := s.DB.NewRaw("UPDATE plans SET max_seats = 1 WHERE id = ?", plan.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var paused *apperr.AppError
+	if err := activate(aliceKey, "alice-new"); !errors.As(err, &paused) || paused.Code != "SEAT_PAUSED" || paused.Status != 403 {
+		t.Fatalf("activate while paused = %v, want 403 SEAT_PAUSED", err)
+	}
+	if _, err := ls.Verify(ctx, VerifyInput{LicenseKey: aliceKey, Identifier: "alice-pc"}); !notFound(err) {
+		t.Fatalf("verify while paused = %v, want LICENSE_NOT_FOUND", err)
+	}
+	if _, err := ls.Verify(ctx, VerifyInput{LicenseKey: ownerKey, Identifier: "owner-pc"}); err != nil {
+		t.Fatalf("the owner stopped with the member paused: %v", err)
+	}
+	// Usage, entitlements and releases go through the same gate: the
+	// paused key is refused before the feature is even looked up.
+	us := NewUsageService(s, NewWebhookService(s, slog.Default(), time.Second, 1, true), nil, slog.Default(), 0.8)
+	if _, err := us.GetQuotaStatus(ctx, aliceKey, "api_calls", ""); !notFound(err) {
+		t.Fatalf("usage while paused = %v, want LICENSE_NOT_FOUND", err)
+	}
+	if _, err := us.GetQuotaStatus(ctx, ownerKey, "api_calls", ""); notFound(err) {
+		t.Fatalf("usage for the owner = %v, want the licence found", err)
+	}
+	if listed, err := seats.ListSeats(ctx, ownerKey, "", lic.Email); err != nil || len(listed) != 1 || !listed[0].Paused {
+		t.Fatalf("seats listed while alice is paused: %v, %+v; want her marked paused", err, listed)
+	}
+	if _, err := s.DB.NewRaw("UPDATE plans SET max_seats = 5 WHERE id = ?", plan.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ls.Verify(ctx, VerifyInput{LicenseKey: aliceKey, Identifier: "alice-pc"}); err != nil {
+		t.Fatalf("verify once there is room again: %v", err)
+	}
+
 	// Removed, the member's key and devices stop.
 	if err := seats.RemoveSeat(ctx, ownerKey, seat.ID, "", "", lic.Email); err != nil {
 		t.Fatal(err)

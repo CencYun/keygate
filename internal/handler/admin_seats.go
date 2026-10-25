@@ -49,6 +49,10 @@ func (h *AdminHandler) ListLicenseSeats(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
+	if err := h.Store.MarkPausedSeats(c, id, seats); err != nil {
+		response.Internal(c, err)
+		return
+	}
 	out := make([]*adminSeat, len(seats))
 	for i, seat := range seats {
 		prefix, hint := keyHint(h.Store.DecryptMemberKey(seat))

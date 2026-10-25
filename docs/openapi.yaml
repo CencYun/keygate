@@ -29,7 +29,18 @@ info:
     with the license's key before members had keys of their own, when
     members shared that key: it moves, once, to the member whose own key
     activates it. Removing the member clears the key and removes their
-    devices and sessions. A member's key works only while the product
+    devices and sessions. When a license holds more people than its seat
+    limit (the plan's `max_seats`, or the seats bought; the owner counts),
+    the members who joined last are paused: their keys answer activation
+    with `403 SEAT_PAUSED`, and verification, checkout and usage as keys
+    that may not be used (releasing their own devices still works),
+    until the owner removes a member or adds seats, which lets them back
+    at once. An offline token issued before the pause runs to its own
+    expiry. The owner is never paused. A license gets there only when
+    its seat limit drops under it: a plan's `max_seats` lowered, or the
+    seats bought lowered in Stripe itself; a plan change from the portal
+    or the admin API refuses to go below the people on it, and an
+    invitation cannot be accepted while no seat is free. A member's key works only while the product
     has seats (a SaaS or hybrid product): should its type change to one
     without, member keys answer as unknown keys until it changes back. The owner keeps the
     license's own key, which does not change once issued; only an admin
@@ -409,6 +420,8 @@ paths:
           description: |
             License not usable now: `LICENSE_EXPIRED`, `LICENSE_CANCELED`,
             `LICENSE_SUSPENDED`, `LICENSE_REVOKED` or `LICENSE_INVALID`.
+            `SEAT_PAUSED`: a member's key while the license holds more
+            people than seats and this member joined beyond the limit.
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "404":
           description: |
@@ -1011,6 +1024,11 @@ paths:
         back to its pre-accept state and the token is consumed
         anyway; the owner must re-invite to mint a fresh token.
 
+        With every seat taken (the limit lowered since the invite was
+        sent), it answers `409 SEAT_LIMIT` before anything else is
+        checked or changed: the invitation stands, and is accepted, or
+        refused as above, once a seat is free.
+
         IP rate-limited to 60 requests/minute. No authentication
         header or cookie is required.
       requestBody:
@@ -1043,6 +1061,9 @@ paths:
                       role: { type: string, enum: [member] }
         "404":
           description: Invalid, expired, already-used, or removed token, or a license not usable now (`SEAT_INVITE_INVALID`)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: "`SEAT_LIMIT`: no seat is free on the license; the invitation still works once one is"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "429":
           $ref: "#/components/responses/RateLimited"
@@ -1882,6 +1903,9 @@ paths:
                                 upgradable:
                                   type: boolean
                                   description: The user owns this license and can upgrade it to a paid plan now (`POST /portal/licenses/upgrade`)
+                                key_paused:
+                                  type: boolean
+                                  description: Only for a member; their seat is paused (the license holds more people than seats), so `license_key` may not be used until a seat is free
                                 cancel_scheduled:
                                   type: boolean
                                   description: Only for the owner; the license's subscription is set to end at its period end (`valid_until`) rather than renew
@@ -3859,8 +3883,14 @@ paths:
         starts a trial, and the update period follows the license type
         (leaving perpetual clears it, entering perpetual starts the new
         plan's period, which needs maintenance features and gated feeds).
-        Suspended and revoked licenses keep their status. Sends
-        `plan.changed` and a plan change email.
+        Suspended and revoked licenses keep their status. Nobody is
+        removed: a plan seating fewer people than are on or invited to
+        the license is refused until some are removed. Moving to a plan
+        sold per seat takes the seats the license holds (its people,
+        coming from a plan not sold per seat), within the new plan's
+        minimum and maximum; `plan.changed` and the audit entry then
+        carry `old_quantity` and `new_quantity`. Sends `plan.changed` and
+        a plan change email.
       x-required-scopes: [admin, "licenses:write"]
       security:
         - BearerAuth: []
@@ -3903,6 +3933,7 @@ paths:
         "409":
           description: |
             - `STRIPE_MANAGED`: billed by a Stripe subscription
+            - `SEATS_IN_USE`: more people on or invited to the license than the new plan seats, `details: {"in_use": 4, "seat_limit": 2}`
             - `LICENSE_CHANGED`: the license moved meanwhile; reload and retry
             - `MAINTENANCE_FEATURES_DISABLED`, `FEED_NOT_GATED`,
               `FEED_CACHE_DRAINING`: the new plan's update period cannot be issued now
@@ -5951,6 +5982,10 @@ webhooks:
                         license_id: { type: string, format: uuid }
                         old_plan_id: { type: string, format: uuid }
                         new_plan_id: { type: string, format: uuid }
+                        old_quantity:
+                          type: integer
+                          description: With `new_quantity`, when an admin moved the license to a plan sold per seat and its seats changed
+                        new_quantity: { type: integer }
                         reason:
                           type: string
                           enum: [refund, subscription_ended, subscription_unpaid, past_due_timeout, grace_period_ended, admin_canceled]
@@ -6728,6 +6763,9 @@ components:
           description: Absent while the invitation is pending
         removed_at: { type: string, format: date-time }
         invite_expires_at: { type: string, format: date-time }
+        paused:
+          type: boolean
+          description: A member who joined beyond the license's seat limit; their own key may not be used until a seat is free. Absent otherwise
         created_at: { type: string, format: date-time }
 
     UsageEvent:

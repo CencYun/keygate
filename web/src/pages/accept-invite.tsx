@@ -6,16 +6,16 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { useSiteConfig } from "@/hooks/use-site-config"
 import { useI18n } from "@/i18n"
-import { invites } from "@/lib/api"
+import { errorCode, invites } from "@/lib/api"
 
 export default function AcceptInvitePage() {
   const { t } = useI18n()
   const [params] = useSearchParams()
   const token = params.get("token") || ""
 
-  // Backend collapses bad/expired/already-accepted into one error
-  // shape so we don't try to distinguish the failure reason here. The
-  // page shows the failure itself, so the global toast stays out of it.
+  // Backend collapses bad/expired/already-accepted into one error, so
+  // the page tells apart only "no seat is free", whose invitation still
+  // stands. It shows the failure itself; the global toast stays out.
   const acceptMut = useMutation({
     mutationFn: () => invites.accept(token),
     meta: { ownErrors: true },
@@ -66,15 +66,17 @@ export default function AcceptInvitePage() {
   }
 
   if (acceptMut.isError) {
+    // Every seat taken: the invitation itself still stands.
+    const noSeat = errorCode(acceptMut.error) === "SEAT_LIMIT"
     return (
       <Shell>
         <Card className="max-w-md">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <XCircle className="h-5 w-5 text-destructive" />
-              {t("acceptInvite.invalidTitle")}
+              {t(noSeat ? "acceptInvite.noSeatTitle" : "acceptInvite.invalidTitle")}
             </CardTitle>
-            <CardDescription>{t("acceptInvite.invalidDesc")}</CardDescription>
+            <CardDescription>{t(noSeat ? "acceptInvite.noSeatDesc" : "acceptInvite.invalidDesc")}</CardDescription>
           </CardHeader>
           <CardContent>
             <Button asChild variant="outline">

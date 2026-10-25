@@ -29,6 +29,9 @@ const en = {
   "acceptInvite.invalidTitle": "Invitation invalid or expired",
   "acceptInvite.invalidDesc":
     "This invitation has already been used, was revoked, or expired. Ask the license owner to send a fresh one.",
+  "acceptInvite.noSeatTitle": "No seat is free right now",
+  "acceptInvite.noSeatDesc":
+    "Every seat on this license is taken. Your invitation still stands: ask the license owner to free a seat, then open the link again.",
   "acceptInvite.acceptedTitle": "Welcome to {product}",
   "acceptInvite.acceptedTitleNoProduct": "Invitation accepted",
   "acceptInvite.acceptedDesc": "You can now use this license. Open the portal to get your own license key.",
@@ -134,7 +137,7 @@ const en = {
   "plans.perSeatValue": "{count} per seat",
   "plans.seatsLowerTitle": "Lower the seat limit?",
   "plans.seatsLowerConfirm":
-    "{count} license(s) on this plan already hold more than {max} people. Everyone on them keeps access, but nobody new can be invited until they are below the limit again. The change applies to every license on the plan at once; to change only what new customers get, create a new plan instead.",
+    "{count} license(s) on this plan already hold more than {max} people. On those, the members who joined last are paused, their keys unusable until a seat is free, and nobody new can be invited. The change applies to every license on the plan at once; to change only what new customers get, create a new plan instead.",
   "plans.licenseModel": "License Model",
   "plans.modelStandard": "Standard",
   "plans.modelFloating": "Floating (concurrent)",
@@ -649,6 +652,13 @@ const en = {
   "portal.seatLimitPendingHint": "Pending invitations hold seats too: cancel one to free its seat.",
   "portal.cancelInviteDesc":
     "The invitation to {email} will be cancelled and its link will stop working. You can invite them again later.",
+  "portal.seatPaused": "Paused",
+  "portal.seatPausedHint": "Over the seat limit: this member cannot use their key until a seat is free.",
+  "portal.pausedMembers":
+    "{count} member(s) are paused: this license has more people than seats, and the last to join wait for a free seat. Removing a member or getting more seats lets them back.",
+  "portal.usagePaused": "Usage is not shown while your access is paused.",
+  "portal.keyPaused":
+    "Your access is paused: this license has more people than seats. Ask the license owner to free a seat or add seats; your key works again as soon as one is free.",
   "portal.memberKeyHint": "This key is yours alone. It stops working if you are removed from this license.",
   "portal.myDevices": "My devices",
   "portal.teamDevices": "All devices",
