@@ -680,13 +680,19 @@ func (s *EmailService) SendLicenseCreated(to, productName, planName, licenseKey,
 // out in daysLeft days, on expiresAt. The reminder job queues it (see
 // ExpiryChecker.remindExpiring) rather than sending it, for the reasons
 // RenderUpdatesEnding gives.
-func (s *EmailService) RenderLicenseExpiring(productName, licenseKey, expiresAt string, daysLeft int, trial bool) (subject, body string) {
+//
+// fallbackPlan is the plan a trial moves to when it ends (the trial
+// plan's TrialFallbackPlanID), or "" when it simply expires: the
+// reminder must not tell a customer they will lose access when they
+// will in fact carry on, on that plan.
+func (s *EmailService) RenderLicenseExpiring(productName, licenseKey, expiresAt string, daysLeft int, trial bool, fallbackPlan string) (subject, body string) {
 	body = s.renderEmail("license_expiring", tmplLicenseExpiring, s.templateData(map[string]any{
-		"Product":    productName,
-		"LicenseKey": licenseKey,
-		"ExpiresAt":  expiresAt,
-		"DaysLeft":   daysLeft,
-		"IsTrial":    trial,
+		"Product":      productName,
+		"LicenseKey":   licenseKey,
+		"ExpiresAt":    expiresAt,
+		"DaysLeft":     daysLeft,
+		"IsTrial":      trial,
+		"FallbackPlan": fallbackPlan,
 	}))
 	subject = productName + " license expiring soon"
 	if trial {
@@ -772,12 +778,19 @@ func (s *EmailService) SendLicenseExpired(to, productName string) {
 	}()
 }
 
-func (s *EmailService) SendTrialExpired(to, productName string) {
+// SendTrialExpired tells a customer their trial has ended. fallbackPlan
+// is the plan the licence moved to (the trial plan's
+// TrialFallbackPlanID), or "" when it expired: one email for the end of
+// a trial either way, so the customer reads what happened to it rather
+// than a bare change of plan names, and the operator writes it once in
+// the template editor.
+func (s *EmailService) SendTrialExpired(to, productName, fallbackPlan string) {
 	if s.skipDisabled("trial_expired", to) {
 		return
 	}
 	body := s.renderEmail("trial_expired", tmplTrialExpired, s.templateData(map[string]any{
-		"Product": productName,
+		"Product":      productName,
+		"FallbackPlan": fallbackPlan,
 	}))
 	go func() {
 		if err := s.Send(to, productName+" trial has ended", body); err != nil {
@@ -1136,7 +1149,7 @@ var templateSample = map[string]any{
 	"Product": "Product", "Plan": "Pro", "LicenseKey": "KEY", "ExpiresAt": "2026-01-01",
 	"UpdatesUntil": "2026-01-01", "Feature": "api_calls", "Used": int64(80), "Limit": int64(100),
 	"Pct": 80, "Inviter": "a@example.com", "InviteURL": "https://example.com/i", "Reason": "reason",
-	"DaysLeft": 3, "IsTrial": true, "DownloadURL": "https://example.com/d", "SiteName": "Site",
+	"DaysLeft": 3, "IsTrial": true, "FallbackPlan": "Free", "DownloadURL": "https://example.com/d", "SiteName": "Site",
 	"PortalURL": "https://example.com/portal", "Role": "admin", "LoginURL": "https://example.com/login",
 }
 
@@ -1183,10 +1196,11 @@ const tmplLicenseCreated = `<!DOCTYPE html>
 
 const tmplLicenseExpiring = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-<h2 style="color: #111;">{{if .IsTrial}}Trial{{else}}License{{end}} Expiring Soon</h2>
-<p>Your <strong>{{.Product}}</strong> {{if .IsTrial}}trial{{else}}license{{end}} expires on <strong>{{.ExpiresAt}}</strong> (days remaining: {{.DaysLeft}}).</p>
+<h2 style="color: #111;">{{if .IsTrial}}Trial Ending Soon{{else}}License Expiring Soon{{end}}</h2>
+<p>Your <strong>{{.Product}}</strong> {{if .IsTrial}}trial ends{{else}}license expires{{end}} on <strong>{{.ExpiresAt}}</strong> (days remaining: {{.DaysLeft}}).</p>
 <p>License key: <code>{{.LicenseKey}}</code></p>
-<p>{{if .IsTrial}}Choose a plan before then to keep using it.{{else}}Please renew to avoid service interruption.{{end}}</p>
+<p>{{if .IsTrial}}{{if .FallbackPlan}}After that your license moves to the <strong>{{.FallbackPlan}}</strong> plan, with the same key, within that plan's limits. To keep more than it offers, choose a plan before then.{{else}}Choose a plan before then to keep using it.{{end}}{{else}}Please renew to avoid service interruption.{{end}}</p>
+{{if and .IsTrial .PortalURL}}<p><a href="{{.PortalURL}}">Open your account</a></p>{{end}}
 </body></html>`
 
 const tmplUpdatesEnding = `<!DOCTYPE html>
@@ -1253,5 +1267,6 @@ const tmplTrialExpired = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2 style="color: #d97706;">Trial Period Ended</h2>
 <p>Your <strong>{{.Product}}</strong> trial has ended.</p>
-<p>Subscribe to a paid plan to continue using all features.</p>
+<p>{{if .FallbackPlan}}Your license carries on with the <strong>{{.FallbackPlan}}</strong> plan, with the same key, and that plan's limits now apply. Choose a paid plan from your account to get more.{{else}}Subscribe to a paid plan to continue using all features.{{end}}</p>
+{{if .PortalURL}}<p><a href="{{.PortalURL}}">Open your account</a></p>{{end}}
 </body></html>`

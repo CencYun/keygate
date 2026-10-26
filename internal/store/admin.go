@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/tabloy/keygate/internal/model"
 )
@@ -673,6 +675,114 @@ func (s *Store) ExpireLicenseIf(ctx context.Context, id string, statuses []strin
 	})
 }
 
+// IsTrialFallbackPlanConflict reports whether err is a plans CHECK
+// refusing trial_fallback_plan_id: on a plan that is not a trial plan,
+// or naming the plan itself. The admin API refuses both first; this is
+// the answer when concurrent edits slipped past it.
+func IsTrialFallbackPlanConflict(err error) bool {
+	var pgErr pgdriver.Error
+	return errors.As(err, &pgErr) && pgErr.Field('C') == "23514" &&
+		(pgErr.Field('n') == "plans_trial_fallback_trial_only" || pgErr.Field('n') == "plans_trial_fallback_not_self")
+}
+
+// TrialMove says what MoveEndedTrialToFallback did.
+type TrialMove struct {
+	// Moved: the licence is now on To, and From is the trial plan it
+	// left.
+	Moved bool
+	// Expire: the licence still qualifies for the trial sweep, but its
+	// plan names no fallback, or one that no longer qualifies (Refusal
+	// says why, for the log), or Stripe bills it. It was expired here,
+	// in the same transaction and under the same locks that decided it,
+	// as it was before fallbacks existed; the caller announces it.
+	Expire  bool
+	Refusal string
+	// FallbackPlanID is the plan the trial plan names, if any.
+	FallbackPlanID string
+	License        *model.License
+	From, To       *model.Plan
+}
+
+// MoveEndedTrialToFallback moves a licence whose trial ended before
+// before onto the plan its trial plan names in trial_fallback_plan_id,
+// in the shape that plan issues licences in: active, with no expiry and
+// no update period — the same re-shape an admin's change-plan gives a
+// licence leaving a trial. The key, activations, seats and add-ons stay
+// as they are, so the customer keeps working on the new plan.
+//
+// It locks the licence and re-checks it first: the sweep read it
+// earlier, and an admin may have extended, moved or reinstated it since
+// (neither Moved nor Expire is set then; nothing changed). The fallback
+// is locked against a concurrent edit and judged again here, as it
+// stands now, so a plan repriced after it was named can never be handed
+// out for nothing.
+//
+// A licence Stripe bills is left to Stripe, which owns its plan (see
+// the admin change-plan): it expires as before.
+func (s *Store) MoveEndedTrialToFallback(ctx context.Context, id string, before time.Time) (TrialMove, error) {
+	var out TrialMove
+	err := RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		out = TrialMove{}
+		lic, err := LockLicenseIn(ctx, tx, id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if lic.Status != model.StatusTrialing || lic.ValidUntil == nil || !lic.ValidUntil.Before(before) {
+			return nil
+		}
+		// The trial plan held too (the licence, then its plan, then the
+		// fallback): a switch of its fallback either waits for this move
+		// or is what it reads, never a fallback it no longer names.
+		from := new(model.Plan)
+		if err := tx.NewSelect().Model(from).Where("id = ?", lic.PlanID).For("SHARE").Scan(ctx); err != nil {
+			return err
+		}
+		out.FallbackPlanID = from.TrialFallbackPlanID
+		// Expiring it is decided and done under these locks, so a fallback
+		// named after the decision cannot be expired past.
+		expire := func(refusal string) error {
+			out.Expire, out.Refusal = true, refusal
+			if _, err := tx.NewRaw("UPDATE licenses SET status = ?, updated_at = now() WHERE id = ?",
+				model.StatusExpired, lic.ID).Exec(ctx); err != nil {
+				return err
+			}
+			return syncSubscriptionStatus(ctx, tx, lic.ID, model.StatusExpired)
+		}
+		if from.TrialFallbackPlanID == "" || lic.StripeSubscriptionID != "" {
+			return expire("")
+		}
+		// FOR SHARE: blocks an edit of the fallback (a new price, a
+		// new type) until this write commits, without blocking the
+		// key-share locks other licences take on it.
+		to := new(model.Plan)
+		err = tx.NewSelect().Model(to).Where("id = ?", from.TrialFallbackPlanID).For("SHARE").Scan(ctx)
+		if errors.Is(err, sql.ErrNoRows) {
+			return expire("plan not found")
+		}
+		if err != nil {
+			return err
+		}
+		if why := to.TrialFallbackRefusal(lic.ProductID); why != "" {
+			return expire(why)
+		}
+		l := *lic
+		l.PlanID, l.Status, l.ValidUntil, l.UpdatesUntil = to.ID, model.StatusActive, nil, nil
+		if err := UpdateLicenseAndSupersedeRenewalsIn(ctx, tx, &l,
+			"plan_id", "status", "valid_until", "updates_until"); err != nil {
+			return err
+		}
+		if err := SyncLicenseSubscriptionIn(ctx, tx, l.ID, to, l.Status, nil); err != nil {
+			return err
+		}
+		out = TrialMove{Moved: true, FallbackPlanID: to.ID, License: &l, From: from, To: to}
+		return nil
+	})
+	return out, err
+}
+
 // ExpireStalePastDueLicenseIf is ExpireLicenseIf for the dunning sweep:
 // the licence must still be past_due, and past due since before the
 // threshold — a licence that was paid and fell past due again after the
@@ -895,6 +1005,81 @@ func (s *Store) ProductBlockers(ctx context.Context, productID string) (plans, l
 
 func (s *Store) PlanLicenseCount(ctx context.Context, planID string) (int, error) {
 	return PlanLicenseCountIn(ctx, s.DB, planID)
+}
+
+// TrialFallbackInUseError: trial plans name the plan as their fallback,
+// so it cannot stop being one they can move to, nor go.
+type TrialFallbackInUseError struct{ Plans []string }
+
+func (e *TrialFallbackInUseError) Error() string {
+	return "the fallback of trial plans " + strings.Join(e.Plans, ", ")
+}
+
+// TrialFallbackRefusedError: the plan named as a trial's fallback cannot
+// be one, as it reads under its lock; the message says why, worded as
+// the admin API's own check words it.
+type TrialFallbackRefusedError struct{ Msg string }
+
+func (e *TrialFallbackRefusedError) Error() string { return e.Msg }
+
+// GuardTrialFallbackTargetIn refuses with *TrialFallbackInUseError when
+// trial plans name planID as their fallback. The caller holds planID's
+// row lock (LockPlanIn), which a trial plan naming it waits on (see
+// LockTrialFallbackIn): either that write committed first and is seen
+// here, or it waits and then sees this one.
+func GuardTrialFallbackTargetIn(ctx context.Context, tx bun.IDB, planID string) error {
+	var names []string
+	err := tx.NewRaw("SELECT name FROM plans WHERE trial_fallback_plan_id = ? ORDER BY name", planID).Scan(ctx, &names)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if len(names) > 0 {
+		return &TrialFallbackInUseError{Plans: names}
+	}
+	return nil
+}
+
+// LockTrialFallbackIn takes a share lock on targetID, the plan a trial
+// plan of productID is to name as its fallback, and checks it can be
+// one as it reads under the lock: an edit or delete of the target holds
+// its row lock across its own check (GuardTrialFallbackTargetIn), so the
+// two never both pass.
+func LockTrialFallbackIn(ctx context.Context, tx bun.IDB, targetID, productID string) error {
+	target := new(model.Plan)
+	err := tx.NewSelect().Model(target).Where("id = ?", targetID).For("SHARE").Scan(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return &TrialFallbackRefusedError{Msg: "trial_fallback_plan_id: plan not found"}
+	}
+	if err != nil {
+		return err
+	}
+	if why := target.TrialFallbackRefusal(productID); why != "" {
+		return &TrialFallbackRefusedError{Msg: "trial_fallback_plan_id " + why}
+	}
+	return nil
+}
+
+// DeletePlanUnlessFallback deletes a plan, unless licences are on it
+// (ErrPlanHasLicenses) or trial plans name it as their fallback
+// (*TrialFallbackInUseError): the checks and the delete under the plan's
+// row lock, which a licence insert's foreign key waits on.
+func (s *Store) DeletePlanUnlessFallback(ctx context.Context, id string) error {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		if err := LockPlanIn(ctx, tx, id); err != nil {
+			return err
+		}
+		n, err := PlanLicenseCountIn(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrPlanHasLicenses
+		}
+		if err := GuardTrialFallbackTargetIn(ctx, tx, id); err != nil {
+			return err
+		}
+		return deletedOne(tx.NewDelete().Model((*model.Plan)(nil)).Where("id = ?", id).Exec(ctx))
+	})
 }
 
 // PlanLicenseCountIn counts on a caller's transaction, for a writer

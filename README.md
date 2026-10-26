@@ -72,6 +72,8 @@ Free plans can take **self sign-up**: the plan's `/pay` link becomes a form wher
 
 A license on a free plan shows **Upgrade** in the portal: the customer pays for a paid plan of the same product through checkout, and that same license moves to it — same key, same activations, no re-install. A full refund, or the end of the subscription, puts it back on the free plan instead of revoking it.
 
+A trial plan can name a free plan to fall back to: when a trial ends, the license moves to that plan instead of expiring, with the same key, and the trial ended email tells the customer which plan they carry on with. That plan's limits then apply: devices already activated keep working (a paused member's once they are back) but no new ones can be activated beyond its limit, and members beyond its seats are paused.
+
 ### 👥 Seats & Entitlements
 
 A license holds a number of seats: set per plan, or sold per seat through Stripe, with customers adding or removing seats in the portal. The buyer owns the license and holds one seat, and invites members to the others; each member gets a license key of their own, and removing a member stops their key and frees their devices. If a license ends up with more people than seats (say a plan's seat limit is lowered), the members who joined last are paused until a seat is free. The license's own key stays fixed once issued; an admin reissues it when needed. Feature entitlements as boolean flags, numeric limits, or usage quotas. Purchasable add-ons that extend plan capabilities.

@@ -302,6 +302,14 @@ type Plan struct {
 	SortOrder   int       `bun:",default:0" json:"sort_order"`
 	CreatedAt   time.Time `bun:",nullzero,default:now()" json:"created_at"`
 
+	// TrialFallbackPlanID, on a trial plan, is the plan a licence
+	// moves to when its trial ends, in place of expiring: same key,
+	// same activations, now on (say) the free tier. Empty = the trial
+	// expires. Only a free plan of the same product, not a trial and
+	// not sold per seat, may be named (TrialFallbackRefusal); see
+	// ExpiryChecker.ExpireTrials.
+	TrialFallbackPlanID string `bun:",nullzero" json:"trial_fallback_plan_id,omitempty"`
+
 	Product      *Product       `bun:"rel:belongs-to,join:product_id=id" json:"product,omitempty"`
 	Entitlements []*Entitlement `bun:"rel:has-many,join:id=plan_id" json:"entitlements,omitempty"`
 }
@@ -486,6 +494,22 @@ type License struct {
 	// Seat.Paused), so the member's key opens the licence but may not be
 	// used. Shown to that member in the portal.
 	KeySeatPaused bool `bun:"-" json:"key_paused,omitempty"`
+}
+
+// GraceDays is how many days past ValidUntil the licence's key keeps
+// working, from its plan (7 without one). A trial that moves to its
+// plan's fallback plan when it ends keeps at least one: the hourly sweep
+// moves it, and until then it must not read as expired, as it would on
+// a plan with no grace. A trial Stripe bills is Stripe's to settle and
+// keeps the plan's number.
+func (l *License) GraceDays() int {
+	if l.Plan == nil {
+		return 7
+	}
+	if l.Status == StatusTrialing && l.Plan.TrialFallbackPlanID != "" && l.StripeSubscriptionID == "" {
+		return max(l.Plan.GraceDays, 1)
+	}
+	return l.Plan.GraceDays
 }
 
 // Limits are the people and devices this licence holds (see
@@ -939,6 +963,33 @@ func UpdatesUntilFor(licenseType string, days int, now time.Time) *time.Time {
 // the one an upgrade checks the licence's current plan against.
 func (p *Plan) IsFree() bool {
 	return p.StripePriceID == "" && p.UpdatesDays == 0 && p.RenewalDays == 0 && p.StripeRenewalPriceID == ""
+}
+
+// TrialFallbackRefusal says why p cannot be the plan that licences of a
+// trial plan of productID move to when their trial ends, or "" when it
+// can. Only a free, non-trial plan of the same product qualifies: a
+// paid one would hand out what is sold for nothing (and a perpetual
+// plan with an update period would also need the gating a sale gets),
+// and a trial one would only start another trial. Nor one sold per
+// seat: its seats are bought, and a licence moved onto it would hold
+// one, below what the plan sells. The admin API asks
+// when the plan is saved and the expiry sweep asks again before it
+// moves a licence, since the target may have been repriced since.
+// Whether the target is active does not matter: active decides what is
+// on sale, and an operator may well keep the free tier off the public
+// plan list while trials still land on it.
+func (p *Plan) TrialFallbackRefusal(productID string) string {
+	switch {
+	case p.ProductID != productID:
+		return "must be a plan of the same product"
+	case p.LicenseType == "trial":
+		return "cannot be a trial plan"
+	case p.PerSeat:
+		return "cannot be a plan sold per seat"
+	case !p.IsFree():
+		return "must be a free plan (no stripe_price_id, update period or renewals)"
+	}
+	return ""
 }
 
 // InitialUpdatesUntil is the maintenance period a new license on this
